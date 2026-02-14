@@ -70,6 +70,10 @@ class AppState extends ChangeNotifier {
   String? get serverIpAddress => _server.ipAddress;
   int get serverPort => _server.port;
 
+  /// Live GPS positions from driver apps, keyed by vehicleId.
+  Map<String, Map<String, dynamic>> get liveVehiclePositions =>
+      _server.vehiclePositions;
+
   // Drivers
   List<Driver> drivers = [];
   List<Map<String, dynamic>> driverStatuses = [];
@@ -472,19 +476,79 @@ class AppState extends ChangeNotifier {
     return _generator.checkDriverRegulations(jobs);
   }
 
-  /// Send message to vehicle
+  /// Send message to vehicle / driver.
+  /// [vehicleId] can also be a driverId — used as target for server routing.
   void sendMessage(String vehicleId, String content) {
     final vehicle = vehicles.firstWhere((v) => v.id == vehicleId,
         orElse: () => Vehicle(id: vehicleId, name: vehicleId));
+    final msgId = _uuid.v4();
     messages.add(DispatchMessage(
-      id: _uuid.v4(),
+      id: msgId,
       vehicleId: vehicleId,
       vehicleName: vehicle.name,
       content: content,
       timestamp: DateTime.now(),
       direction: MessageDirection.outgoing,
     ));
+
+    if (_server.isRunning) {
+      _server.addDispatchMessage({
+        'id': msgId,
+        'targetDriverId': vehicleId,
+        'body': content,
+        'category': 'dispatch',
+        'senderName': 'Dispečink',
+      });
+    }
     notifyListeners();
+  }
+
+  /// Send a broadcast message to ALL connected drivers.
+  void sendBroadcast(String content) {
+    final msgId = _uuid.v4();
+    messages.add(DispatchMessage(
+      id: msgId,
+      vehicleId: '__broadcast__',
+      vehicleName: 'Všichni řidiči',
+      content: content,
+      timestamp: DateTime.now(),
+      direction: MessageDirection.outgoing,
+    ));
+
+    if (_server.isRunning) {
+      _server.addDispatchMessage({
+        'id': msgId,
+        'targetDriverId': '__broadcast__',
+        'body': content,
+        'category': 'dispatch',
+        'senderName': 'Dispečink',
+      });
+    }
+    notifyListeners();
+  }
+
+  /// Get list of currently connected driver IDs (from live GPS positions).
+  List<String> get connectedDriverIds {
+    return _server.vehiclePositions.entries
+        .map((e) => e.value['driverId'] as String? ?? e.key)
+        .toSet()
+        .toList();
+  }
+
+  /// Get display info for a connected driver by driverId.
+  Map<String, String> getConnectedDriverInfo(String driverId) {
+    for (final entry in _server.vehiclePositions.values) {
+      final id = entry['driverId'] as String? ?? '';
+      if (id == driverId) {
+        return {
+          'driverId': id,
+          'driverName': entry['driverName'] as String? ?? id,
+          'lineNumber': entry['lineNumber'] as String? ?? '',
+          'vehicleId': entry['vehicleId'] as String? ?? '',
+        };
+      }
+    }
+    return {'driverId': driverId, 'driverName': driverId};
   }
 
   /// Mark message as read
@@ -554,8 +618,29 @@ class AppState extends ChangeNotifier {
   /// Start distribution server
   Future<bool> startServer({int port = 8080}) async {
     final started = await _server.start(port: port);
+    if (started) {
+      _server.onPositionReceived((_) {
+        notifyListeners();
+      });
+      _server.onMessageReceived((data) {
+        _handleIncomingDriverMessage(data);
+      });
+    }
     notifyListeners();
     return started;
+  }
+
+  void _handleIncomingDriverMessage(Map<String, dynamic> data) {
+    final msg = DispatchMessage(
+      id: data['id'] as String? ?? _uuid.v4(),
+      vehicleId: data['vehicleId'] as String? ?? data['driverId'] as String? ?? 'unknown',
+      vehicleName: data['driverName'] as String? ?? data['driverId'] as String? ?? 'Řidič',
+      content: '${data['categoryEmoji'] ?? ''} ${data['body'] ?? data['category'] ?? ''}'.trim(),
+      timestamp: DateTime.tryParse(data['createdAt'] as String? ?? '') ?? DateTime.now(),
+      direction: MessageDirection.incoming,
+    );
+    messages.insert(0, msg);
+    notifyListeners();
   }
 
   /// Stop distribution server

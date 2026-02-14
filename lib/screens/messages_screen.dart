@@ -60,6 +60,16 @@ class _MessagesScreenState extends State<MessagesScreen> {
                       ],
                     ),
                   ),
+                  ElevatedButton.icon(
+                    onPressed: () => _showComposeDialog(context, state),
+                    icon: const Icon(Icons.send, size: 16),
+                    label: const Text('Nová zpráva'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppTheme.accent,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
                   if (state.unreadCount > 0)
                     OutlinedButton(
                       onPressed: () => state.markAllRead(),
@@ -173,6 +183,229 @@ class _MessagesScreenState extends State<MessagesScreen> {
       _replyController.clear();
       setState(() => _replyToVehicleId = null);
     }
+  }
+
+  void _showComposeDialog(BuildContext context, AppState state) {
+    showDialog(
+      context: context,
+      builder: (ctx) => _ComposeMessageDialog(state: state),
+    );
+  }
+}
+
+class _ComposeMessageDialog extends StatefulWidget {
+  final AppState state;
+
+  const _ComposeMessageDialog({required this.state});
+
+  @override
+  State<_ComposeMessageDialog> createState() => _ComposeMessageDialogState();
+}
+
+class _ComposeMessageDialogState extends State<_ComposeMessageDialog> {
+  final _messageController = TextEditingController();
+  String _targetType = 'broadcast';
+  String? _selectedDriverId;
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final connectedIds = widget.state.connectedDriverIds;
+
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.send, color: AppTheme.accent, size: 22),
+          SizedBox(width: 8),
+          Text('Nová zpráva řidiči'),
+        ],
+      ),
+      content: SizedBox(
+        width: 480,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Příjemce',
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: AppTheme.textSecondary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                ChoiceChip(
+                  label: const Text('Všichni řidiči'),
+                  selected: _targetType == 'broadcast',
+                  onSelected: (_) => setState(() {
+                    _targetType = 'broadcast';
+                    _selectedDriverId = null;
+                  }),
+                  selectedColor: AppTheme.accent.withValues(alpha: 0.2),
+                ),
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: const Text('Konkrétní řidič'),
+                  selected: _targetType == 'specific',
+                  onSelected: (_) => setState(() {
+                    _targetType = 'specific';
+                  }),
+                  selectedColor: AppTheme.accent.withValues(alpha: 0.2),
+                ),
+              ],
+            ),
+            if (_targetType == 'specific') ...[
+              const SizedBox(height: 12),
+              if (connectedIds.isEmpty)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppTheme.warningLight,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.info_outline, size: 16, color: AppTheme.warning),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Žádní řidiči nejsou připojeni. Zpráva bude doručena při příštím spojení.',
+                          style: TextStyle(fontSize: 12, color: AppTheme.warning),
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              else
+                DropdownButtonFormField<String>(
+                  value: _selectedDriverId,
+                  decoration: const InputDecoration(
+                    hintText: 'Vyberte řidiče...',
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                  ),
+                  items: connectedIds.map((id) {
+                    final info = widget.state.getConnectedDriverInfo(id);
+                    final name = info['driverName'] ?? id;
+                    final line = info['lineNumber'] ?? '';
+                    return DropdownMenuItem(
+                      value: id,
+                      child: Text(
+                        line.isNotEmpty ? '$name (Linka $line)' : name,
+                        style: const TextStyle(fontSize: 14),
+                      ),
+                    );
+                  }).toList(),
+                  onChanged: (val) => setState(() => _selectedDriverId = val),
+                ),
+            ],
+            const SizedBox(height: 16),
+            const Text(
+              'Zpráva',
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: AppTheme.textSecondary,
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _messageController,
+              maxLines: 4,
+              decoration: const InputDecoration(
+                hintText: 'Napište zprávu pro řidiče...',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Rychlé zprávy',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: AppTheme.textMuted,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                _QuickMsgChip(
+                  label: 'Změna trasy',
+                  onTap: () => _messageController.text = 'Pozor: změna trasy. Sledujte pokyny dispečinku.',
+                ),
+                _QuickMsgChip(
+                  label: 'Bez zpoždění',
+                  onTap: () => _messageController.text = 'Dodržujte prosím jízdní řád bez zpoždění.',
+                ),
+                _QuickMsgChip(
+                  label: 'Přestávka',
+                  onTap: () => _messageController.text = 'Na konečné máte povolenou přestávku 10 min.',
+                ),
+                _QuickMsgChip(
+                  label: 'Rozjezd výlukové trasy',
+                  onTap: () => _messageController.text = 'Přejděte na výlukovou trasu dle aktuálního plánu.',
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Zrušit'),
+        ),
+        ElevatedButton.icon(
+          onPressed: () {
+            final text = _messageController.text.trim();
+            if (text.isEmpty) return;
+            if (_targetType == 'broadcast') {
+              widget.state.sendBroadcast(text);
+            } else if (_selectedDriverId != null) {
+              widget.state.sendMessage(_selectedDriverId!, text);
+            } else {
+              return;
+            }
+            Navigator.pop(context);
+          },
+          icon: const Icon(Icons.send, size: 16),
+          label: Text(
+            _targetType == 'broadcast' ? 'Odeslat všem' : 'Odeslat',
+          ),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: AppTheme.accent,
+            foregroundColor: Colors.white,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _QuickMsgChip extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+
+  const _QuickMsgChip({required this.label, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return ActionChip(
+      label: Text(label, style: const TextStyle(fontSize: 12)),
+      onPressed: onTap,
+      backgroundColor: AppTheme.surfaceWhite,
+      side: BorderSide(color: AppTheme.border),
+    );
   }
 }
 

@@ -12,9 +12,47 @@ class TimetableServer {
   int _port = 8080;
   String? _ipAddress;
 
+  /// In-memory store of latest GPS positions from driver apps.
+  /// Key = vehicleId, Value = position data map.
+  final Map<String, Map<String, dynamic>> _vehiclePositions = {};
+
+  /// In-memory message store.
+  /// Messages from drivers (incoming to dispatch) and from dispatch (outgoing to drivers).
+  final List<Map<String, dynamic>> _messages = [];
+
   bool get isRunning => _server != null;
   int get port => _port;
   String? get ipAddress => _ipAddress;
+
+  /// Get current vehicle GPS positions (for map display).
+  Map<String, Map<String, dynamic>> get vehiclePositions =>
+      Map.unmodifiable(_vehiclePositions);
+
+  /// Get all stored messages.
+  List<Map<String, dynamic>> get messages => List.unmodifiable(_messages);
+
+  /// Callback for when a new position is received from a driver.
+  void Function(Map<String, dynamic>)? _onPositionReceived;
+
+  /// Callback for when a driver sends a message.
+  void Function(Map<String, dynamic>)? _onMessageReceived;
+
+  /// Set a callback to be notified when a driver sends a GPS position.
+  void onPositionReceived(void Function(Map<String, dynamic>) callback) {
+    _onPositionReceived = callback;
+  }
+
+  /// Set a callback to be notified when a driver sends a message.
+  void onMessageReceived(void Function(Map<String, dynamic>) callback) {
+    _onMessageReceived = callback;
+  }
+
+  /// Store a dispatch-originated message (for driver pickup via polling).
+  void addDispatchMessage(Map<String, dynamic> msg) {
+    msg['direction'] = 'outgoing';
+    msg['createdAt'] = msg['createdAt'] ?? DateTime.now().toIso8601String();
+    _messages.add(msg);
+  }
 
   /// Start the HTTP server
   Future<bool> start({int port = 8080}) async {
@@ -162,6 +200,139 @@ class TimetableServer {
           headers: {'Content-Type': 'application/json'},
         );
       }
+    });
+
+    // Receive GPS position from a driver app
+    router.post('/api/position', (Request request) async {
+      try {
+        final body = await request.readAsString();
+        final data = json.decode(body) as Map<String, dynamic>;
+
+        final vehicleId = data['vehicleId'] as String? ?? 'unknown';
+        data['receivedAt'] = DateTime.now().toIso8601String();
+
+        _vehiclePositions[vehicleId] = data;
+
+        // Also notify via callback if set
+        if (_onPositionReceived != null) {
+          _onPositionReceived!(data);
+        }
+
+        return Response.ok(
+          json.encode({'status': 'ok'}),
+          headers: {'Content-Type': 'application/json'},
+        );
+      } catch (e) {
+        return Response.internalServerError(
+          body: json.encode({'error': e.toString()}),
+          headers: {'Content-Type': 'application/json'},
+        );
+      }
+    });
+
+    // Get all current vehicle GPS positions
+    router.get('/api/positions', (Request request) {
+      // Remove stale positions (older than 60 seconds)
+      final now = DateTime.now();
+      _vehiclePositions.removeWhere((_, v) {
+        final ts = v['receivedAt'] as String?;
+        if (ts == null) return true;
+        final received = DateTime.tryParse(ts);
+        if (received == null) return true;
+        return now.difference(received).inSeconds > 60;
+      });
+
+      return Response.ok(
+        json.encode({
+          'positions': _vehiclePositions,
+          'count': _vehiclePositions.length,
+          'timestamp': now.toIso8601String(),
+        }),
+        headers: {'Content-Type': 'application/json'},
+      );
+    });
+
+    // ── Messaging ────────────────────────────────────────
+
+    // Driver sends a message to dispatch
+    router.post('/api/messages', (Request request) async {
+      try {
+        final body = await request.readAsString();
+        final data = json.decode(body) as Map<String, dynamic>;
+
+        data['receivedAt'] = DateTime.now().toIso8601String();
+        data['direction'] = 'incoming'; // driver → dispatch
+
+        _messages.add(data);
+
+        if (_onMessageReceived != null) {
+          _onMessageReceived!(data);
+        }
+
+        return Response.ok(
+          json.encode({'status': 'ok', 'id': data['id'] ?? ''}),
+          headers: {'Content-Type': 'application/json'},
+        );
+      } catch (e) {
+        return Response.internalServerError(
+          body: json.encode({'error': e.toString()}),
+          headers: {'Content-Type': 'application/json'},
+        );
+      }
+    });
+
+    // Dispatch sends a message to a specific driver (stored for pickup)
+    router.post('/api/messages/dispatch', (Request request) async {
+      try {
+        final body = await request.readAsString();
+        final data = json.decode(body) as Map<String, dynamic>;
+
+        data['createdAt'] = data['createdAt'] ?? DateTime.now().toIso8601String();
+        data['direction'] = 'outgoing'; // dispatch → driver
+
+        _messages.add(data);
+
+        return Response.ok(
+          json.encode({'status': 'ok'}),
+          headers: {'Content-Type': 'application/json'},
+        );
+      } catch (e) {
+        return Response.internalServerError(
+          body: json.encode({'error': e.toString()}),
+          headers: {'Content-Type': 'application/json'},
+        );
+      }
+    });
+
+    // Driver polls for messages addressed to them from dispatch
+    router.get('/api/messages/<driverId>', (Request request, String driverId) {
+      final sinceParam = request.url.queryParameters['since'];
+      DateTime? since;
+      if (sinceParam != null) since = DateTime.tryParse(sinceParam);
+
+      final forDriver = _messages.where((m) {
+        if (m['direction'] != 'outgoing') return false;
+        final target = m['targetDriverId'] as String?;
+        if (target != '__broadcast__' && target != driverId) return false;
+        if (since != null) {
+          final createdAt = DateTime.tryParse(m['createdAt'] as String? ?? '');
+          if (createdAt != null && createdAt.isBefore(since)) return false;
+        }
+        return true;
+      }).toList();
+
+      return Response.ok(
+        json.encode({'messages': forDriver, 'count': forDriver.length}),
+        headers: {'Content-Type': 'application/json'},
+      );
+    });
+
+    // Get all messages (for dispatch UI)
+    router.get('/api/messages', (Request request) {
+      return Response.ok(
+        json.encode({'messages': _messages, 'count': _messages.length}),
+        headers: {'Content-Type': 'application/json'},
+      );
     });
 
     return router;

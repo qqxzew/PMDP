@@ -197,6 +197,7 @@ class _VehicleMapScreenState extends State<VehicleMapScreen> {
                 transferNodes: state.transferNodes,
                 simulationService: state.simulationService,
                 osrmRoutingService: state.osrmRoutingService,
+                livePositions: state.liveVehiclePositions,
               ),
             ),
           ],
@@ -387,6 +388,7 @@ class _VehicleMapView extends StatefulWidget {
   final List<TransferNode> transferNodes;
   final SimulationService simulationService;
   final OsrmRoutingService osrmRoutingService;
+  final Map<String, Map<String, dynamic>> livePositions;
 
   const _VehicleMapView({
     required this.selectedLineNumbers,
@@ -398,6 +400,7 @@ class _VehicleMapView extends StatefulWidget {
     required this.transferNodes,
     required this.simulationService,
     required this.osrmRoutingService,
+    required this.livePositions,
   });
 
   @override
@@ -619,8 +622,57 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
     // ── Vehicle markers (simulation-aware) ──
     final vehicleMarkers = <Marker>[];
     final simPositions = sim.positions;
+    final livePos = widget.livePositions;
 
-    if (sim.isRunning && simPositions.isNotEmpty) {
+    // Priority: live GPS positions > simulation > static fallback
+    if (livePos.isNotEmpty) {
+      // Show REAL GPS positions from driver devices
+      for (final entry in livePos.entries) {
+        final vid = entry.key;
+        final data = entry.value;
+        final lat = (data['lat'] as num?)?.toDouble();
+        final lng = (data['lng'] as num?)?.toDouble();
+        final lineNum = data['lineNumber'] as String? ?? '';
+        if (lat == null || lng == null) continue;
+
+        // Filter by selected lines (if lineNumber is reported)
+        if (widget.selectedLineNumbers.isNotEmpty &&
+            lineNum.isNotEmpty &&
+            !widget.selectedLineNumbers.contains(lineNum)) continue;
+
+        vehicleMarkers.add(Marker(
+          point: LatLng(lat, lng),
+          width: _selectedVehicleId == vid ? 20 : 14,
+          height: _selectedVehicleId == vid ? 20 : 14,
+          child: GestureDetector(
+            onTap: () {
+              setState(() {
+                _selectedVehicleId = _selectedVehicleId == vid ? null : vid;
+              });
+            },
+            child: Container(
+              decoration: BoxDecoration(
+                color: const Color(0xFF10B981), // Green = live GPS
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: _selectedVehicleId == vid ? Colors.yellow : Colors.white,
+                  width: _selectedVehicleId == vid ? 2.5 : 1.5,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF10B981).withValues(alpha: 0.4),
+                    blurRadius: 6,
+                    spreadRadius: 1,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ));
+      }
+    }
+
+    if (vehicleMarkers.isEmpty && sim.isRunning && simPositions.isNotEmpty) {
       // Use live simulation positions
       for (final vp in simPositions.values) {
         // Фильтр по выбранным линиям (показуємо тільки вибрані)
@@ -770,6 +822,7 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
               vehicleId: _selectedVehicleId!,
               allVehicles: widget.allVehicles,
               simPosition: simPositions[_selectedVehicleId],
+              livePosition: livePos[_selectedVehicleId],
               getVehicleJobs: widget.getVehicleJobs,
               onClose: () => setState(() => _selectedVehicleId = null),
             ),
@@ -814,6 +867,43 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
             onPressed: () => setState(() => _isLegendVisible = !_isLegendVisible),
           ),
         ),
+
+        // ── Live GPS indicator ──
+        if (livePos.isNotEmpty)
+          Positioned(
+            bottom: 20,
+            left: 20,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF10B981),
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.2), blurRadius: 8)],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 8, height: 8,
+                    decoration: const BoxDecoration(
+                      color: Colors.white,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    '${livePos.length} LIVE',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w800,
+                      color: Colors.white,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
 
         // ── Legend Panel ──
         if (_isLegendVisible)
@@ -1068,6 +1158,7 @@ class _VehicleInfoCard extends StatelessWidget {
   final String vehicleId;
   final List<Vehicle> allVehicles;
   final VehiclePosition? simPosition;
+  final Map<String, dynamic>? livePosition;
   final List<TimetableJob> Function(String) getVehicleJobs;
   final VoidCallback onClose;
   
@@ -1077,12 +1168,14 @@ class _VehicleInfoCard extends StatelessWidget {
     required this.getVehicleJobs,
     required this.onClose,
     this.simPosition,
+    this.livePosition,
   });
 
   @override
   Widget build(BuildContext context) {
     final vehicle = allVehicles.where((v) => v.id == vehicleId).firstOrNull;
-    if (vehicle == null) return const SizedBox.shrink();
+    // Allow showing card for live-only vehicles (not in static list)
+    if (vehicle == null && livePosition == null) return const SizedBox.shrink();
     
     final jobs = getVehicleJobs(vehicleId);
     final currentJob = jobs.where((j) => 
@@ -1116,7 +1209,7 @@ class _VehicleInfoCard extends StatelessWidget {
                   borderRadius: BorderRadius.circular(6),
                 ),
                 child: Text(
-                  vehicle.id,
+                  vehicle?.id ?? vehicleId,
                   style: const TextStyle(
                     fontSize: 15,
                     fontWeight: FontWeight.w700,
@@ -1135,8 +1228,111 @@ class _VehicleInfoCard extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           
-          // Line info
-          if (simPosition != null) ...[
+          // Live GPS info
+          if (livePosition != null) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              margin: const EdgeInsets.only(bottom: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF10B981).withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: const Color(0xFF10B981).withValues(alpha: 0.3)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 8, height: 8,
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF10B981),
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'LIVE GPS',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xFF10B981),
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            // Line & direction
+            if (livePosition!['lineNumber'] != null && (livePosition!['lineNumber'] as String).isNotEmpty)
+              _InfoRow(
+                icon: Icons.route,
+                label: 'Linka',
+                value: livePosition!['lineNumber'] as String,
+              ),
+            if ((livePosition!['direction'] as String? ?? '').isNotEmpty) ...[
+              const SizedBox(height: 8),
+              _InfoRow(
+                icon: Icons.alt_route,
+                label: 'Směr',
+                value: livePosition!['direction'] as String,
+              ),
+            ],
+            // Current & next stop
+            if ((livePosition!['currentStopName'] as String? ?? '').isNotEmpty) ...[
+              const SizedBox(height: 8),
+              _InfoRow(
+                icon: Icons.place,
+                label: 'Aktuální',
+                value: livePosition!['currentStopName'] as String,
+              ),
+            ],
+            if ((livePosition!['nextStopName'] as String? ?? '').isNotEmpty) ...[
+              const SizedBox(height: 8),
+              _InfoRow(
+                icon: Icons.arrow_forward,
+                label: 'Další',
+                value: livePosition!['nextStopName'] as String,
+              ),
+            ],
+            // Stop progress
+            if ((livePosition!['totalStops'] as int? ?? 0) > 0) ...[
+              const SizedBox(height: 8),
+              _InfoRow(
+                icon: Icons.linear_scale,
+                label: 'Postup',
+                value: '${(livePosition!['currentStopIndex'] as int? ?? 0) + 1} / ${livePosition!['totalStops']}',
+              ),
+            ],
+            // Delay
+            if ((livePosition!['delayMinutes'] as int? ?? 0) != 0) ...[
+              const SizedBox(height: 8),
+              _LiveDelayBadge(delayMinutes: livePosition!['delayMinutes'] as int),
+            ],
+            // Scheduled arrival
+            if ((livePosition!['scheduledArrival'] as String? ?? '').isNotEmpty) ...[
+              const SizedBox(height: 8),
+              _InfoRow(
+                icon: Icons.schedule,
+                label: 'Plán',
+                value: livePosition!['scheduledArrival'] as String,
+              ),
+            ],
+            // Driver
+            if (livePosition!['driverId'] != null || (livePosition!['driverName'] as String? ?? '').isNotEmpty) ...[
+              const SizedBox(height: 8),
+              _InfoRow(
+                icon: Icons.person,
+                label: 'Řidič',
+                value: () {
+                  final name = livePosition!['driverName'] as String? ?? '';
+                  final id = livePosition!['driverId'] as String? ?? '';
+                  if (name.isNotEmpty && id.isNotEmpty) return '$name ($id)';
+                  if (name.isNotEmpty) return name;
+                  return id;
+                }(),
+              ),
+            ],
+            const SizedBox(height: 8),
+          ] else if (simPosition != null) ...[
             _InfoRow(
               icon: Icons.route,
               label: 'Linka',
@@ -1181,18 +1377,18 @@ class _VehicleInfoCard extends StatelessWidget {
                 ),
               ),
           ] else ...[
-            if (vehicle.currentLineNumber != null)
+            if (vehicle?.currentLineNumber != null)
               _InfoRow(
                 icon: Icons.route,
                 label: 'Linka',
-                value: vehicle.currentLineNumber!,
+                value: vehicle!.currentLineNumber!,
               ),
             const SizedBox(height: 8),
-            if (vehicle.currentStopName != null)
+            if (vehicle?.currentStopName != null)
               _InfoRow(
                 icon: Icons.place,
                 label: 'Zastávka',
-                value: vehicle.currentStopName!,
+                value: vehicle!.currentStopName!,
               ),
           ],
           
@@ -1348,6 +1544,63 @@ class _InfoRow extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+// ── Delay badge for live GPS info ───────────────────────────────────────────
+
+class _LiveDelayBadge extends StatelessWidget {
+  final int delayMinutes;
+
+  const _LiveDelayBadge({required this.delayMinutes});
+
+  @override
+  Widget build(BuildContext context) {
+    final isLate = delayMinutes > 0;
+    final isEarly = delayMinutes < 0;
+    final color = isLate
+        ? const Color(0xFFEF4444)
+        : isEarly
+            ? const Color(0xFF3B82F6)
+            : const Color(0xFF10B981);
+    final bgColor = isLate
+        ? const Color(0xFFFEE2E2)
+        : isEarly
+            ? const Color(0xFFDBEAFE)
+            : const Color(0xFFD1FAE5);
+    final text = isLate
+        ? '+$delayMinutes min'
+        : isEarly
+            ? '${delayMinutes} min'
+            : 'Včas';
+    final icon = isLate
+        ? Icons.warning_amber_rounded
+        : isEarly
+            ? Icons.fast_forward
+            : Icons.check_circle;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: bgColor,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: color),
+          const SizedBox(width: 6),
+          Text(
+            text,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              color: color,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
