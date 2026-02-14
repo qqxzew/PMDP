@@ -30,6 +30,9 @@ class GtfsParser {
       _loadCalendars(),
       _loadTransfers(),
     ]);
+
+    // Add test line TT programmatically
+    _addTestLineTT();
   }
 
   /// Detekuje pozice sloupců z hlavičky CSV
@@ -242,6 +245,111 @@ class GtfsParser {
       minutes: int.tryParse(parts[1]) ?? 0,
       seconds: int.tryParse(parts[2]) ?? 0,
     );
+  }
+
+  /// Add test line TT programmatically (mock data for testing)
+  void _addTestLineTT() {
+    // 1. Add test stops if not already present
+    final testStops = [
+      GtfsStop(
+        stopId: 'S001',
+        stopName: 'Suka',
+        stopLat: 49.729277,
+        stopLon: 13.408736,
+      ),
+      GtfsStop(
+        stopId: 'S002',
+        stopName: 'Pizdec',
+        stopLat: 49.729353,
+        stopLon: 13.408916,
+      ),
+      GtfsStop(
+        stopId: 'S003',
+        stopName: 'Blyat',
+        stopLat: 49.729290,
+        stopLon: 13.409138,
+      ),
+      GtfsStop(
+        stopId: 'S004',
+        stopName: 'Ebat',
+        stopLat: 49.729313,
+        stopLon: 13.409241,
+      ),
+    ];
+
+    for (final stop in testStops) {
+      if (!stops.containsKey(stop.stopId)) {
+        stops[stop.stopId] = stop;
+      }
+    }
+
+    // 2. Add test route TT
+    final testRoute = GtfsRoute(
+      routeId: 'ROUTE_TT',
+      agencyId: 'PMDP',
+      routeShortName: 'TT',
+      routeLongName: 'Test Line',
+      routeType: 3, // Bus
+      dir1From: 'Suka',
+      dir1To: 'Ebat',
+      dir2From: 'Ebat',
+      dir2To: 'Suka',
+    );
+    routes.add(testRoute);
+
+    // 3. Add test trip
+    final testTrip = GtfsTrip(
+      routeId: 'ROUTE_TT',
+      serviceId: 'WEEKDAY',
+      tripId: 'TRIP_TT_001',
+      directionId: 0,
+      tripShortName: 'TT',
+      shapeId: '',
+    );
+    trips.add(testTrip);
+
+    // 4. Add stop times for the test trip
+    final testStopTimes = [
+      GtfsStopTime(
+        tripId: 'TRIP_TT_001',
+        arrivalTime: Duration.zero, // Will be set relative to start
+        departureTime: const Duration(hours: 19, minutes: 15), // 19:15
+        stopId: 'S001',
+        stopSequence: 1,
+        pickupType: 0,
+        dropOffType: 1, // No drop-off at first stop
+      ),
+      GtfsStopTime(
+        tripId: 'TRIP_TT_001',
+        arrivalTime: const Duration(hours: 19, minutes: 16),
+        departureTime: const Duration(hours: 19, minutes: 16),
+        stopId: 'S002',
+        stopSequence: 2,
+        pickupType: 0,
+        dropOffType: 0,
+      ),
+      GtfsStopTime(
+        tripId: 'TRIP_TT_001',
+        arrivalTime: const Duration(hours: 19, minutes: 17),
+        departureTime: const Duration(hours: 19, minutes: 17),
+        stopId: 'S003',
+        stopSequence: 3,
+        pickupType: 0,
+        dropOffType: 0,
+      ),
+      GtfsStopTime(
+        tripId: 'TRIP_TT_001',
+        arrivalTime: const Duration(hours: 19, minutes: 18),
+        departureTime: Duration.zero, // Last stop
+        stopId: 'S004',
+        stopSequence: 4,
+        pickupType: 1, // No pickup at last stop
+        dropOffType: 0,
+      ),
+    ];
+    stopTimes.addAll(testStopTimes);
+
+    debugPrint('Test line TT added to GTFS data: 4 stops, 1 route, 1 trip');
   }
 
   List<GtfsStopTime> _revenueStops(List<GtfsStopTime> times) {

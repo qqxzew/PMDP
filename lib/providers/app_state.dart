@@ -117,8 +117,8 @@ class AppState extends ChangeNotifier {
       final allRoutes = _parser.buildRouteData();
       debugPrint('buildRouteData returned ${allRoutes.length} routes');
 
-      // Nouzové linky: 4, 16, 33 a všechny noční (N*)
-      const emergencyLines = {'4', '16', '33'};
+      // Nouzové linky: 4, 16, 33, TT (test) a všechny noční (N*)
+      const emergencyLines = {'4', '16', '33', 'TT'};
       final filtered = allRoutes.where((r) {
         final name = r.route.routeShortName;
         return emergencyLines.contains(name) || name.startsWith('N');
@@ -130,12 +130,23 @@ class AppState extends ChangeNotifier {
       routes = filtered.where((r) => seen.add(r.route.routeShortName)).toList();
       debugPrint('After dedup: ${routes.length} routes');
 
-      // Seřadit: nejdříve čísla, pak N-linky
+      // Seřadit: nejdříve čísla, pak TT, pak N-linky
       routes.sort((a, b) {
         final aName = a.route.routeShortName;
         final bName = b.route.routeShortName;
         final aIsN = aName.startsWith('N');
         final bIsN = bName.startsWith('N');
+        final aIsTT = aName == 'TT';
+        final bIsTT = bName == 'TT';
+        
+        // TT před N-linkami, po číselných
+        if (aIsTT && !bIsTT && !bIsN) return 1; // TT after numbers
+        if (bIsTT && !aIsTT && !aIsN) return -1;
+        if (aIsTT && bIsN) return -1; // TT before N
+        if (bIsTT && aIsN) return 1;
+        if (aIsTT && bIsTT) return 0;
+        
+        // N-linky na konec
         if (aIsN != bIsN) return aIsN ? 1 : -1;
         final aNum = int.tryParse(aName.replaceFirst('N', ''));
         final bNum = int.tryParse(bName.replaceFirst('N', ''));
