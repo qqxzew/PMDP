@@ -295,6 +295,7 @@ class AppState extends ChangeNotifier {
     required String stopName2,
     required String lineNumber2,
     int maxWaitMinutes = 5,
+    TransferPriority priority = TransferPriority.equal,
   }) {
     final transfer = _transferManager.createManualTransfer(
       stopId1: stopId1,
@@ -305,7 +306,10 @@ class AppState extends ChangeNotifier {
       lineNumber2: lineNumber2,
       maxWaitMinutes: maxWaitMinutes,
     );
-    transferNodes.add(transfer);
+    
+    // Set priority if not equal
+    final transferWithPriority = transfer.copyWith(priority: priority);
+    transferNodes.add(transferWithPriority);
     
     // Инвалидируем кэш маршрутов для затронутых линий
     osrmRoutingService.invalidateLineRoutes([lineNumber1, lineNumber2]);

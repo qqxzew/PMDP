@@ -379,29 +379,17 @@ class _TransfersScreenState extends State<TransfersScreen> {
         contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         border: OutlineInputBorder(),
       ),
+      isExpanded: true,
       initialValue: _selectedStopId,
       items: nearbyStops.entries.map((entry) {
         final data = entry.value;
         final distance = (data['distance'] as double).round();
         return DropdownMenuItem(
           value: entry.key,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                '${data['name']} (${distance}m)',
-                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-              ),
-              Text(
-                'L${_selectedLine1}: ${data['line1Direction']}',
-                style: const TextStyle(fontSize: 10, color: AppTheme.textMuted),
-              ),
-              Text(
-                'L${_selectedLine2}: ${data['line2Direction']}',
-                style: const TextStyle(fontSize: 10, color: AppTheme.textMuted),
-              ),
-            ],
+          child: Text(
+            '${data['name']} (${distance}m)',
+            style: const TextStyle(fontSize: 12),
+            overflow: TextOverflow.ellipsis,
           ),
         );
       }).toList(),
@@ -451,16 +439,9 @@ class _TransfersScreenState extends State<TransfersScreen> {
     // Инвалидируем кэш геометрии маршрутов для перезагрузки
     _routeGeometry.clear();
     
-    // Перезагружаем геометрию только для измененных линий
-    Future.delayed(const Duration(milliseconds: 500), () {
-      _warmupRouteGeometry(
-        state,
-        onlyLines: {
-          _selectedLine1!,
-          _selectedLine2!,
-        },
-      );
-    });
+    // Сохраняем значения перед сбросом для использования в Future
+    final line1 = _selectedLine1;
+    final line2 = _selectedLine2;
     
     // Reset selection
     setState(() {
@@ -468,6 +449,16 @@ class _TransfersScreenState extends State<TransfersScreen> {
       _selectedLine2 = null;
       _selectedStopId = null;
     });
+    
+    // Перезагружаем геометрию только для измененных линий
+    if (line1 != null && line2 != null) {
+      Future.delayed(const Duration(milliseconds: 500), () {
+        _warmupRouteGeometry(
+          state,
+          onlyLines: {line1, line2},
+        );
+      });
+    }
     
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
@@ -756,12 +747,12 @@ class _TransfersScreenState extends State<TransfersScreen> {
     }
 
     if (!mounted) return;
-    final maxWait = await showDialog<int>(
+    final result = await showDialog<Map<String, dynamic>>(
       context: context,
       builder: (ctx) => _CreateTransferDialog(a: a, b: b),
     );
 
-    if (maxWait != null) {
+    if (result != null) {
       state.addManualTransfer(
         stopId1: a.stopId,
         stopName1: a.stopName,
@@ -769,7 +760,8 @@ class _TransfersScreenState extends State<TransfersScreen> {
         stopId2: b.stopId,
         stopName2: b.stopName,
         lineNumber2: b.lineNumber,
-        maxWaitMinutes: maxWait,
+        maxWaitMinutes: result['maxWait'] as int,
+        priority: result['priority'] as TransferPriority,
       );
     }
 
@@ -883,6 +875,54 @@ class _TransferTableRow extends StatelessWidget {
               ),
             ],
           ),
+          const SizedBox(height: 10),
+          const Text('Приоритет:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppTheme.textPrimary)),
+          const SizedBox(height: 6),
+          DropdownButtonFormField<TransferPriority>(
+            value: transfer.priority,
+            decoration: const InputDecoration(
+              isDense: true,
+              contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              border: OutlineInputBorder(),
+            ),
+            items: [
+              DropdownMenuItem(
+                value: TransferPriority.equal,
+                child: Row(
+                  children: [
+                    const Icon(Icons.sync_alt, size: 16, color: AppTheme.textMuted),
+                    const SizedBox(width: 8),
+                    Text('Oba čekají (равный)', style: const TextStyle(fontSize: 12)),
+                  ],
+                ),
+              ),
+              DropdownMenuItem(
+                value: TransferPriority.line1First,
+                child: Row(
+                  children: [
+                    const Icon(Icons.arrow_forward, size: 16, color: AppTheme.primary),
+                    const SizedBox(width: 8),
+                    Text('${transfer.lineNumber2} čeká na ${transfer.lineNumber1}', style: const TextStyle(fontSize: 12)),
+                  ],
+                ),
+              ),
+              DropdownMenuItem(
+                value: TransferPriority.line2First,
+                child: Row(
+                  children: [
+                    const Icon(Icons.arrow_back, size: 16, color: AppTheme.primary),
+                    const SizedBox(width: 8),
+                    Text('${transfer.lineNumber1} čeká na ${transfer.lineNumber2}', style: const TextStyle(fontSize: 12)),
+                  ],
+                ),
+              ),
+            ],
+            onChanged: (value) {
+              if (value != null) {
+                state.updateTransfer(transfer.id, priority: value);
+              }
+            },
+          ),
         ],
       ),
     );
@@ -925,6 +965,7 @@ class _CreateTransferDialog extends StatefulWidget {
 
 class _CreateTransferDialogState extends State<_CreateTransferDialog> {
   int _maxWait = 5;
+  TransferPriority _priority = TransferPriority.equal;
 
   @override
   Widget build(BuildContext context) {
@@ -939,7 +980,7 @@ class _CreateTransferDialogState extends State<_CreateTransferDialog> {
             Text('Линия ${widget.a.lineNumber}: ${widget.a.stopName}'),
             const SizedBox(height: 4),
             Text('Линия ${widget.b.lineNumber}: ${widget.b.stopName}'),
-            const SizedBox(height: 12),
+            const SizedBox(height: 16),
             Row(
               children: [
                 const Text('maxWaitMinutes'),
@@ -959,6 +1000,36 @@ class _CreateTransferDialogState extends State<_CreateTransferDialog> {
                 ),
               ],
             ),
+            const SizedBox(height: 16),
+            const Text('Приоритет:', style: TextStyle(fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<TransferPriority>(
+              value: _priority,
+              decoration: const InputDecoration(
+                isDense: true,
+                contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                border: OutlineInputBorder(),
+              ),
+              items: [
+                const DropdownMenuItem(
+                  value: TransferPriority.equal,
+                  child: Text('Oba čekají (равный)'),
+                ),
+                DropdownMenuItem(
+                  value: TransferPriority.line1First,
+                  child: Text('${widget.b.lineNumber} čeká na ${widget.a.lineNumber}'),
+                ),
+                DropdownMenuItem(
+                  value: TransferPriority.line2First,
+                  child: Text('${widget.a.lineNumber} čeká na ${widget.b.lineNumber}'),
+                ),
+              ],
+              onChanged: (value) {
+                if (value != null) {
+                  setState(() => _priority = value);
+                }
+              },
+            ),
           ],
         ),
       ),
@@ -968,7 +1039,7 @@ class _CreateTransferDialogState extends State<_CreateTransferDialog> {
           child: const Text('Отмена'),
         ),
         ElevatedButton(
-          onPressed: () => Navigator.pop(context, _maxWait),
+          onPressed: () => Navigator.pop(context, {'maxWait': _maxWait, 'priority': _priority}),
           child: const Text('Создать'),
         ),
       ],
