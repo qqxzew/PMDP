@@ -16,6 +16,37 @@ enum RouteDirection {
   both,
 }
 
+/// Helper class to store line with direction information
+class LineWithDirection {
+  final String lineNumber;
+  final String destination; // конечная остановка
+  final bool isForward; // направление: true = forward, false = backward
+  
+  LineWithDirection({
+    required this.lineNumber,
+    required this.destination,
+    required this.isForward,
+  });
+  
+  String get displayName => '$lineNumber → $destination';
+  String get directionArrow => '→ $destination';
+  
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LineWithDirection &&
+          runtimeType == other.runtimeType &&
+          lineNumber == other.lineNumber &&
+          destination == other.destination &&
+          isForward == other.isForward;
+
+  @override
+  int get hashCode => lineNumber.hashCode ^ destination.hashCode ^ isForward.hashCode;
+  
+  @override
+  String toString() => displayName;
+}
+
 class TransfersScreen extends StatefulWidget {
   const TransfersScreen({super.key});
 
@@ -47,8 +78,8 @@ class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAli
   final Set<String> _activeLineNumbers = {};
 
   // Selection state for creating transfers
-  String? _selectedLine1;
-  String? _selectedLine2;
+  LineWithDirection? _selectedLine1;
+  LineWithDirection? _selectedLine2;
   String? _selectedStopId;
   int _syncGapMinutes = 5;
 
@@ -384,19 +415,51 @@ class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAli
     );
   }
 
-  Widget _buildLineDropdown(String label, String? value, Function(String?) onChanged, AppState state) {
-    return DropdownButtonFormField<String>(
+  Widget _buildLineDropdown(String label, LineWithDirection? value, Function(LineWithDirection?) onChanged, AppState state) {
+    // Build list of all line+direction combinations
+    final List<LineWithDirection> lineOptions = [];
+    
+    for (final route in state.routes) {
+      final lineNumber = route.route.routeShortName;
+      
+      // Forward direction
+      if (route.forwardStopTimes.isNotEmpty) {
+        final lastStopId = route.forwardStopTimes.last.stopId;
+        final destination = state.stops[lastStopId]?.stopName ?? '?';
+        lineOptions.add(LineWithDirection(
+          lineNumber: lineNumber,
+          destination: destination,
+          isForward: true,
+        ));
+      }
+      
+      // Backward direction
+      if (route.backwardStopTimes.isNotEmpty) {
+        final lastStopId = route.backwardStopTimes.last.stopId;
+        final destination = state.stops[lastStopId]?.stopName ?? '?';
+        lineOptions.add(LineWithDirection(
+          lineNumber: lineNumber,
+          destination: destination,
+          isForward: false,
+        ));
+      }
+    }
+    
+    return DropdownButtonFormField<LineWithDirection>(
       decoration: InputDecoration(
         labelText: label,
         isDense: true,
         contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         border: const OutlineInputBorder(),
       ),
-      initialValue: value,
-      items: state.routes.map((route) {
+      value: value,
+      items: lineOptions.map((line) {
         return DropdownMenuItem(
-          value: route.route.routeShortName,
-          child: Text(route.route.routeShortName),
+          value: line,
+          child: Text(
+            line.displayName,
+            overflow: TextOverflow.ellipsis,
+          ),
         );
       }).toList(),
       onChanged: onChanged,
@@ -404,38 +467,31 @@ class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAli
   }
 
   Widget _buildStopDropdown(AppState state) {
-    final route1 = state.routes.firstWhere((r) => r.route.routeShortName == _selectedLine1);
-    final route2 = state.routes.firstWhere((r) => r.route.routeShortName == _selectedLine2);
+    if (_selectedLine1 == null || _selectedLine2 == null) {
+      return const Text('Vyberte obě linky', style: TextStyle(fontSize: 12, color: AppTheme.textSecondary));
+    }
     
-    // Получаем конечные остановки для определения направления
-    final route1FwdDest = route1.forwardStopTimes.isNotEmpty 
-        ? state.stops[route1.forwardStopTimes.last.stopId]?.stopName ?? '?'
-        : '?';
-    final route1BwdDest = route1.backwardStopTimes.isNotEmpty
-        ? state.stops[route1.backwardStopTimes.last.stopId]?.stopName ?? '?'
-        : '?';
-    final route2FwdDest = route2.forwardStopTimes.isNotEmpty
-        ? state.stops[route2.forwardStopTimes.last.stopId]?.stopName ?? '?'
-        : '?';
-    final route2BwdDest = route2.backwardStopTimes.isNotEmpty
-        ? state.stops[route2.backwardStopTimes.last.stopId]?.stopName ?? '?'
-        : '?';
+    final route1 = state.routes.firstWhere((r) => r.route.routeShortName == _selectedLine1!.lineNumber);
+    final route2 = state.routes.firstWhere((r) => r.route.routeShortName == _selectedLine2!.lineNumber);
     
-    final stops1Fwd = route1.forwardStopTimes.map((st) => st.stopId).toSet();
-    final stops1Bwd = route1.backwardStopTimes.map((st) => st.stopId).toSet();
-    final stops2Fwd = route2.forwardStopTimes.map((st) => st.stopId).toSet();
-    final stops2Bwd = route2.backwardStopTimes.map((st) => st.stopId).toSet();
+    // Get stops for selected directions
+    final stops1 = _selectedLine1!.isForward 
+        ? route1.forwardStopTimes.map((st) => st.stopId).toSet()
+        : route1.backwardStopTimes.map((st) => st.stopId).toSet();
     
-    // Находим близкие остановки между двумя маршрутами (без дубликатов)
+    final stops2 = _selectedLine2!.isForward
+        ? route2.forwardStopTimes.map((st) => st.stopId).toSet()
+        : route2.backwardStopTimes.map((st) => st.stopId).toSet();
+    
+    // Find nearby stops between the two routes
     final nearbyStops = <String, Map<String, dynamic>>{};
     final processedStops = <String>{};
     
-    // Проверяем все комбинации направлений
-    for (final stopId1 in [...stops1Fwd, ...stops1Bwd]) {
+    for (final stopId1 in stops1) {
       final stop1 = state.stops[stopId1];
       if (stop1 == null || processedStops.contains(stop1.stopName)) continue;
       
-      for (final stopId2 in [...stops2Fwd, ...stops2Bwd]) {
+      for (final stopId2 in stops2) {
         final stop2 = state.stops[stopId2];
         if (stop2 == null) continue;
         
@@ -447,18 +503,12 @@ class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAli
         if (distance < 200) {
           if (processedStops.contains(stop1.stopName)) continue;
           
-          // Определяем направления для обеих линий
-          final line1Dir = stops1Fwd.contains(stopId1) ? '→ $route1FwdDest' : '→ $route1BwdDest';
-          final line2Dir = stops2Fwd.contains(stopId2) ? '→ $route2FwdDest' : '→ $route2BwdDest';
-          
           final key = stopId1 == stopId2 ? stopId1 : '$stopId1-$stopId2';
           nearbyStops[key] = {
             'stopId1': stopId1,
             'stopId2': stopId2,
             'name': stop1.stopName,
             'distance': distance,
-            'line1Direction': line1Dir,
-            'line2Direction': line2Dir,
           };
           processedStops.add(stop1.stopName);
           break;
@@ -468,7 +518,7 @@ class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAli
     
     if (nearbyStops.isEmpty) {
       return const Text(
-        'Žádné blízké zastávky mezi těmito linkami',
+        'Žádné společné zastávky mezi těmito směry',
         style: TextStyle(fontSize: 12, color: AppTheme.warning),
       );
     }
@@ -481,7 +531,7 @@ class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAli
         border: OutlineInputBorder(),
       ),
       isExpanded: true,
-      initialValue: _selectedStopId,
+      value: _selectedStopId,
       items: nearbyStops.entries.map((entry) {
         final data = entry.value;
         final distance = (data['distance'] as double).round();
@@ -526,27 +576,27 @@ class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAli
     
     if (stop1 == null || stop2 == null) return;
     
-    // Добавляем transfer node
+    // Добавляем transfer node с информацией о направлениях
     state.addManualTransfer(
       stopId1: stopId1,
       stopName1: stop1.stopName,
-      lineNumber1: _selectedLine1!,
+      lineNumber1: _selectedLine1!.lineNumber,
+      direction1: _selectedLine1!.directionArrow,
       stopId2: stopId2,
       stopName2: stop2.stopName,
-      lineNumber2: _selectedLine2!,
+      lineNumber2: _selectedLine2!.lineNumber,
+      direction2: _selectedLine2!.directionArrow,
       maxWaitMinutes: _syncGapMinutes,
     );
     
     // Инвалидируем кэш геометрии маршрутов только для затронутых линий
-    final line1 = _selectedLine1;
-    final line2 = _selectedLine2;
+    final line1 = _selectedLine1!.lineNumber;
+    final line2 = _selectedLine2!.lineNumber;
     
-    if (line1 != null && line2 != null) {
-      _routeGeometry.remove('line:$line1:0');
-      _routeGeometry.remove('line:$line1:1');
-      _routeGeometry.remove('line:$line2:0');
-      _routeGeometry.remove('line:$line2:1');
-    }
+    _routeGeometry.remove('line:$line1:0');
+    _routeGeometry.remove('line:$line1:1');
+    _routeGeometry.remove('line:$line2:0');
+    _routeGeometry.remove('line:$line2:1');
     
     // Reset selection
     setState(() {
@@ -584,8 +634,8 @@ class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAli
     // Check if we have selected lines for transfer creation
     final hasSelectedLines = _selectedLine1 != null || _selectedLine2 != null;
     final selectedLines = {
-      if (_selectedLine1 != null) _selectedLine1!,
-      if (_selectedLine2 != null) _selectedLine2!,
+      if (_selectedLine1 != null) _selectedLine1!.lineNumber,
+      if (_selectedLine2 != null) _selectedLine2!.lineNumber,
     };
 
     final polylines = <Polyline>[];
@@ -1012,9 +1062,11 @@ class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAli
         stopId1: a.stopId,
         stopName1: a.stopName,
         lineNumber1: a.lineNumber,
+        direction1: '', // Map-based transfer (no specific direction)
         stopId2: b.stopId,
         stopName2: b.stopName,
         lineNumber2: b.lineNumber,
+        direction2: '', // Map-based transfer (no specific direction)
         maxWaitMinutes: result['maxWait'] as int,
         priority: result['priority'] as TransferPriority,
       );

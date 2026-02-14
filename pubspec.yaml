@@ -1,5 +1,5 @@
-name: blackout_dispatch
-description: "Dispečerská aplikace pro nouzové jízdní řády při blackoutu"
+name: bod_dispatching
+description: "BOD - Blackout Dispatching: Dispečerská aplikace pro nouzové jízdní řády"
 publish_to: 'none'
 version: 1.0.0+1
 

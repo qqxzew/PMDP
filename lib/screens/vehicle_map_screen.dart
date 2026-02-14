@@ -472,8 +472,10 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
   Future<void> _loadOsrmRoutesForSelected() async {
     if (_isLoadingOsrmRoutes) return;
     
+    // Load routes either for selected lines or for all routes if nothing is filtered
     final selectedRoutes = widget.routes.where((route) {
-      return widget.selectedLineNumbers.contains(route.route.routeShortName);
+      return widget.selectedLineNumbers.isEmpty || 
+             widget.selectedLineNumbers.contains(route.route.routeShortName);
     }).toList();
 
     if (selectedRoutes.isEmpty) return;
@@ -562,10 +564,17 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
     const plzenCenter = LatLng(49.7475, 13.3776);
     final sim = widget.simulationService;
 
-    if (!_isLoadingOsrmRoutes && widget.selectedLineNumbers.isNotEmpty) {
+    // Check if we need to load OSRM routes
+    if (!_isLoadingOsrmRoutes) {
       var needsLoad = false;
-      for (final route in widget.routes) {
-        if (!widget.selectedLineNumbers.contains(route.route.routeShortName)) continue;
+      
+      // Load routes either for selected lines or for all routes if nothing is filtered
+      final routesToCheck = widget.routes.where((route) {
+        return widget.selectedLineNumbers.isEmpty || 
+               widget.selectedLineNumbers.contains(route.route.routeShortName);
+      });
+      
+      for (final route in routesToCheck) {
         final key0 = '${route.route.routeId}_0';
         final key1 = '${route.route.routeId}_1';
         if (!_osrmPolylines.containsKey(key0) || !_osrmPolylines.containsKey(key1)) {
@@ -573,6 +582,7 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
           break;
         }
       }
+      
       if (needsLoad) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) {

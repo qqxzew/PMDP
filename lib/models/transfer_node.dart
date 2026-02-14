@@ -15,9 +15,11 @@ class TransferNode {
   final String stopId1;
   final String stopName1;
   final String lineNumber1;
+  final String direction1; // e.g., "→ Košutka"
   final String stopId2;
   final String stopName2;
   final String lineNumber2;
+  final String direction2; // e.g., "→ Bolevec"
   final bool isAutomatic;
   int maxWaitMinutes;
   bool isEnabled;
@@ -28,9 +30,11 @@ class TransferNode {
     required this.stopId1,
     required this.stopName1,
     required this.lineNumber1,
+    required this.direction1,
     required this.stopId2,
     required this.stopName2,
     required this.lineNumber2,
+    required this.direction2,
     required this.isAutomatic,
     this.maxWaitMinutes = 5,
     this.isEnabled = true,
@@ -41,16 +45,16 @@ class TransferNode {
   bool get isSameStop => stopId1 == stopId2;
 
   String get displayLabel =>
-      'Linka $lineNumber1 <-> Linka $lineNumber2 @ $stopName1${isSameStop ? '' : ' / $stopName2'}';
+      'Linka $lineNumber1$direction1 <-> Linka $lineNumber2$direction2 @ $stopName1${isSameStop ? '' : ' / $stopName2'}';
 
   String get priorityLabel {
     switch (priority) {
       case TransferPriority.equal:
         return 'Oba čekají';
       case TransferPriority.line1First:
-        return 'Linka $lineNumber2 čeká na $lineNumber1';
+        return 'Linka $lineNumber2$direction2 čeká na $lineNumber1$direction1';
       case TransferPriority.line2First:
-        return 'Linka $lineNumber1 čeká na $lineNumber2';
+        return 'Linka $lineNumber1$direction1 čeká na $lineNumber2$direction2';
     }
   }
 
@@ -64,9 +68,11 @@ class TransferNode {
       stopId1: stopId1,
       stopName1: stopName1,
       lineNumber1: lineNumber1,
+      direction1: direction1,
       stopId2: stopId2,
       stopName2: stopName2,
       lineNumber2: lineNumber2,
+      direction2: direction2,
       isAutomatic: isAutomatic,
       maxWaitMinutes: maxWaitMinutes ?? this.maxWaitMinutes,
       isEnabled: isEnabled ?? this.isEnabled,

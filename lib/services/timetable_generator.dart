@@ -119,16 +119,28 @@ class TimetableGenerator {
     const endHour = 24;
     const serviceMinutes = (endHour - startHour) * 60;
     
-    // Stagger vehicle start times to maintain frequency
-    final startTimeOffset = cycleTime ~/ busCount;
+    // НОВА ЛОГІКА: половина автобусів починає з прямого напрямку, половина - зі зворотного
+    // Це забезпечує одночасний виїзд з двох кінцевих зупинок
+    final halfBuses = busCount ~/ 2;
+    final otherHalf = busCount - halfBuses;
+    
+    // Stagger within each direction group to maintain frequency
+    final startTimeOffset = busCount > 1 ? (cycleTime ~/ busCount) : baseInterval;
     
     // Generate jobs for each vehicle
     for (int busIndex = 0; busIndex < busCount; busIndex++) {
       final vehicleId = vehicleIds[busIndex];
       
-      // Staggered start time for this vehicle
-      var currentTime = Duration(minutes: startHour * 60 + (busIndex * startTimeOffset));
-      var currentDirection = 0; // Start with forward direction
+      // Визначаємо початковий напрямок: перша половина - прямий (0), друга - зворотний (1)
+      final isFirstHalf = busIndex < halfBuses;
+      var currentDirection = isFirstHalf ? 0 : 1;
+      
+      // Визначаємо індекс всередині групи (для зміщення старту)
+      final groupIndex = isFirstHalf ? busIndex : (busIndex - halfBuses);
+      final groupSize = isFirstHalf ? halfBuses : otherHalf;
+      
+      // Staggered start time - автобуси в одній групі виїжджають з інтервалом
+      var currentTime = Duration(minutes: startHour * 60 + (groupIndex * startTimeOffset));
       
       // Generate trips for this vehicle throughout the day
       while (currentTime.inMinutes < endHour * 60) {
