@@ -12,12 +12,19 @@ class GtfsParser {
   List<GtfsCalendar> calendars = [];
   List<GtfsAgency> agencies = [];
   List<GtfsTransfer> gtfsTransfers = [];
+  Map<String, List<GtfsShape>> shapes = {};
 
   Future<void> loadAll() async {
     await Future.wait([
       _loadAgencies(),
       _loadStops(),
       _loadRoutes(),
+      _loadShapes(),
+    ]);
+
+    // Trips need routes, shapes need to be ready if we want to validata, but purely parsing is independent.
+    // However, loading trips often relies on nothing but the file itself.
+    await Future.wait([
       _loadTrips(),
       _loadStopTimes(),
       _loadCalendars(),
@@ -119,6 +126,7 @@ class GtfsParser {
         tripId: _col(r, cols, 'trip_id'),
         directionId: int.tryParse(_col(r, cols, 'direction_id', '0')) ?? 0,
         tripShortName: _col(r, cols, 'trip_short_name'),
+        shapeId: _col(r, cols, 'shape_id'),
       ));
     }
   }
@@ -137,7 +145,54 @@ class GtfsParser {
         stopSequence: int.tryParse(_col(r, cols, 'stop_sequence', '0')) ?? 0,
         pickupType: int.tryParse(_col(r, cols, 'pickup_type', '0')) ?? 0,
         dropOffType: int.tryParse(_col(r, cols, 'drop_off_type', '0')) ?? 0,
+        shapeDistTraveled: double.tryParse(_col(r, cols, 'shape_dist_traveled')),
       ));
+    }
+  }
+
+  Future<void> _loadShapes() async {
+    try {
+      final rows = await _loadCsv('shapes.txt');
+      if (rows.length <= 1) return;
+      
+      final cols = _getColumnMap(rows[0]);
+      final shapeList = <GtfsShape>[];
+  
+      for (int i = 1; i < rows.length; i++) {
+          final r = rows[i];
+          final shapeId = _col(r, cols, 'shape_id');
+          final shapePtLat = double.tryParse(_col(r, cols, 'shape_pt_lat')) ?? 0.0;
+          final shapePtLon = double.tryParse(_col(r, cols, 'shape_pt_lon')) ?? 0.0;
+          final shapePtSequence = int.tryParse(_col(r, cols, 'shape_pt_sequence', '0')) ?? 0;
+          final shapeDistTraveledStr = _col(r, cols, 'shape_dist_traveled');
+          double? shapeDistTraveled;
+          if (shapeDistTraveledStr.isNotEmpty) {
+              shapeDistTraveled = double.tryParse(shapeDistTraveledStr);
+          }
+  
+          shapeList.add(GtfsShape(
+              shapeId: shapeId,
+              shapePtLat: shapePtLat,
+              shapePtLon: shapePtLon,
+              shapePtSequence: shapePtSequence,
+              shapeDistTraveled: shapeDistTraveled,
+          ));
+      }
+  
+      // Grouping by shapeId
+      for (var shape in shapeList) {
+          if (!shapes.containsKey(shape.shapeId)) {
+              shapes[shape.shapeId] = [];
+          }
+          shapes[shape.shapeId]!.add(shape);
+      }
+      
+      // Sort
+      for (var key in shapes.keys) {
+          shapes[key]!.sort((a, b) => a.shapePtSequence.compareTo(b.shapePtSequence));
+      }
+    } catch (e) {
+      debugPrint('Warning: shapes.txt not found or invalid ($e). Using linear interpolation.');
     }
   }
 

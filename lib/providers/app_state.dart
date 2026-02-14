@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import '../models/gtfs_models.dart';
@@ -5,21 +7,38 @@ import '../models/timetable_models.dart';
 import '../models/transfer_node.dart';
 import '../models/vehicle.dart';
 import '../services/gtfs_parser.dart';
+import '../services/live_simulation_engine.dart';
+import '../services/osrm_routing_service.dart';
+import '../services/simulation_service.dart';
 import '../services/timetable_generator.dart';
 import '../services/transfer_manager.dart';
 
 /// Central application state
 class AppState extends ChangeNotifier {
   static const _uuid = Uuid();
-  static const _line4BonusCoefficient = 1.5;
 
   final GtfsParser _parser = GtfsParser();
-  final TimetableGenerator _generator = TimetableGenerator();
-  final TransferManager _transferManager = TransferManager();
+  late final TimetableGenerator _generator;
+  late final TransferManager _transferManager;
+  late final LiveSimulationEngine simulationEngine;
+  late final OsrmRoutingService osrmRoutingService;
+  late final SimulationService simulationService;
+
+  AppState() {
+    osrmRoutingService = OsrmRoutingService();
+    _generator = TimetableGenerator(routingService: osrmRoutingService);
+    simulationEngine = LiveSimulationEngine(_parser);
+    simulationService = SimulationService(
+      simulationEngine,
+      routingService: osrmRoutingService,
+    );
+    _transferManager = TransferManager(simulationEngine);
+  }
 
   // GTFS data
   Map<String, GtfsStop> stops = {};
   List<RouteData> routes = [];
+  Map<String, List<GtfsShape>> shapes = {};
   bool isLoading = true;
 
   // Configuration
@@ -70,7 +89,8 @@ class AppState extends ChangeNotifier {
     try {
       await _parser.loadAll();
       stops = _parser.stops;
-      debugPrint('GTFS loaded: ${_parser.routes.length} routes, ${_parser.trips.length} trips, ${_parser.stopTimes.length} stopTimes, ${stops.length} stops');
+      shapes = _parser.shapes;
+      debugPrint('GTFS loaded: ${_parser.routes.length} routes, ${_parser.trips.length} trips, ${_parser.stopTimes.length} stopTimes, ${stops.length} stops, ${shapes.length} shapes');
       final allRoutes = _parser.buildRouteData();
       debugPrint('buildRouteData returned ${allRoutes.length} routes');
 
@@ -100,11 +120,8 @@ class AppState extends ChangeNotifier {
         return aName.compareTo(bName);
       });
 
-      // Auto-detect transfers
-      transferNodes = _transferManager.detectAutomaticTransfers(
-        routes: routes,
-        stops: stops,
-      );
+      // No auto-detect – only manual transfers
+      transferNodes = [];
 
       // Generate demo messages
       _generateDemoMessages();
@@ -142,11 +159,13 @@ class AppState extends ChangeNotifier {
     route.targetIntervalMinutes = minutes.clamp(0, 180);
 
     if (route.targetIntervalMinutes > 0 && route.roundTripMinutes > 0) {
-      final needed = route.requiredBusesForTargetInterval;
+      // Формула: N = T_cycle / I
+      // Минимум 1 автобус на линию ВСЕГДА
+      final needed = route.requiredBusesForTargetInterval.clamp(1, 999);
       final currentTotal =
           routes.fold(0, (int sum, r) => sum + r.assignedBuses) - route.assignedBuses;
       final maxForRoute = totalAvailableBuses - currentTotal;
-      route.assignedBuses = needed.clamp(0, maxForRoute);
+      route.assignedBuses = needed.clamp(1, maxForRoute);
     }
 
     _invalidateGeneratedTimetable();
@@ -163,16 +182,53 @@ class AppState extends ChangeNotifier {
       return 0;
     }
 
-    final assigned = <RouteData, int>{for (final route in routes) route: 0};
+    // ШАГ 1: Гарантируем минимум 2 автобуса каждой линии (для движения в обе стороны)
+    final minBusesPerRoute = 2;
+    final minRequired = routes.length * minBusesPerRoute;
+    
+    if (totalAvailableBuses < minRequired) {
+      // Недостаточно автобусов даже для минимума - распределяем по 1-2
+      for (int i = 0; i < routes.length; i++) {
+        routes[i].assignedBuses = (i < totalAvailableBuses ~/ 2) ? 2 : ((i < totalAvailableBuses) ? 1 : 0);
+      }
+      _invalidateGeneratedTimetable();
+      notifyListeners();
+      return routes.fold(0, (sum, r) => sum + r.assignedBuses);
+    }
+
+    // Выделяем каждой линии по 2 автобуса
+    final assigned = <RouteData, int>{for (final route in routes) route: minBusesPerRoute};
+    var remainingBuses = totalAvailableBuses - minRequired;
+
+    // ШАГ 2: Рассчитываем важность каждой линии
+    // Вес = комбинированный индекс: интенсивность, длительность цикла, дефицит к целевому интервалу
     final weights = <RouteData, double>{};
     var totalWeights = 0.0;
 
     for (final route in routes) {
-      final baseWeight = route.totalTrips > 0 ? route.totalTrips.toDouble() : 1.0;
-      final coefficient = route.route.routeShortName == '4' ? _line4BonusCoefficient : 1.0;
-      final weight = baseWeight * coefficient;
+      final demandScore = math.max(route.totalTrips.toDouble(), 1.0);
+      final cycleScore = math.max(route.roundTripMinutes.toDouble(), 30.0) / 30.0;
+      final targetNeed = route.requiredBusesForTargetInterval > 0
+        ? math.max(route.requiredBusesForTargetInterval - minBusesPerRoute, 0).toDouble()
+        : 0.0;
+      final coverageScore = math.sqrt(math.max(route.allStopIds.length.toDouble(), 1.0));
+
+      var weight =
+        (demandScore * 0.45) +
+        (cycleScore * 0.25) +
+        (targetNeed * 0.20) +
+        (coverageScore * 0.10);
+
+      if (weight < 1.0) weight = 1.0;
+
       weights[route] = weight;
       totalWeights += weight;
+
+      debugPrint('🚌 Linka ${route.route.routeShortName}: '
+        'рейсов=${route.totalTrips}, '
+        'цикл=${route.roundTripMinutes}мин, '
+        'дефицит=${targetNeed.toStringAsFixed(1)}, '
+          'вес=${weight.toStringAsFixed(1)}');
     }
 
     if (totalWeights <= 0) {
@@ -182,35 +238,52 @@ class AppState extends ChangeNotifier {
       }
     }
 
-    var used = 0;
-    final remainders = <MapEntry<RouteData, double>>[];
+    // ШАГ 3: Распределяем оставшиеся автобусы пропорционально весам
+    var distributed = 0;
+    final remainders = <RouteData, double>{};
 
     for (final route in routes) {
       final weight = weights[route] ?? 1.0;
-      final exact = totalAvailableBuses * (weight / totalWeights);
-      final buses = exact.floor();
-      assigned[route] = buses;
-      used += buses;
-      remainders.add(MapEntry(route, exact - buses));
+      final exactShare = remainingBuses * (weight / totalWeights);
+      final wholeBuses = exactShare.floor();
+
+      assigned[route] = (assigned[route] ?? minBusesPerRoute) + wholeBuses;
+      distributed += wholeBuses;
+      remainders[route] = exactShare - wholeBuses;
+
+      debugPrint('🚌 Linka ${route.route.routeShortName}: '
+          'базовых=$minBusesPerRoute + дополнительных=$wholeBuses = ${assigned[route]} автобусов');
     }
 
-    var leftover = totalAvailableBuses - used;
-    remainders.sort((a, b) => b.value.compareTo(a.value));
-    var idx = 0;
-    while (leftover > 0 && remainders.isNotEmpty) {
-      final route = remainders[idx % remainders.length].key;
-      assigned[route] = (assigned[route] ?? 0) + 1;
+    // ШАГ 4: Распределяем остаток автобусов по наибольшему дробному остатку
+    var leftover = remainingBuses - distributed;
+
+    final sortedRoutes = routes.toList()
+      ..sort((a, b) {
+        final byRemainder = (remainders[b] ?? 0).compareTo(remainders[a] ?? 0);
+        if (byRemainder != 0) return byRemainder;
+        return (weights[b] ?? 0).compareTo(weights[a] ?? 0);
+      });
+
+    for (final route in sortedRoutes) {
+      if (leftover <= 0) break;
+      assigned[route] = (assigned[route] ?? minBusesPerRoute) + 1;
       leftover--;
-      idx++;
     }
 
+    // ШАГ 5: Применяем результаты (гарантия минимум 2 на линию уже обеспечена)
+    var totalAssigned = 0;
     for (final route in routes) {
-      route.assignedBuses = assigned[route] ?? 0;
+      final buses = assigned[route] ?? minBusesPerRoute;
+      route.assignedBuses = buses;
+      totalAssigned += buses;
     }
 
     _invalidateGeneratedTimetable();
     notifyListeners();
-    return routes.fold(0, (sum, r) => sum + r.assignedBuses);
+    
+    debugPrint('Auto-přiřazení: $totalAssigned autobусов z $totalAvailableBuses (linek: ${routes.length})');
+    return totalAssigned;
   }
 
   /// Add a manual transfer node
@@ -233,17 +306,22 @@ class AppState extends ChangeNotifier {
       maxWaitMinutes: maxWaitMinutes,
     );
     transferNodes.add(transfer);
+    
+    // Инвалидируем кэш маршрутов для затронутых линий
+    osrmRoutingService.invalidateLineRoutes([lineNumber1, lineNumber2]);
+    
     _invalidateGeneratedTimetable();
     notifyListeners();
   }
 
   /// Update transfer node
-  void updateTransfer(String id, {int? maxWaitMinutes, bool? isEnabled}) {
+  void updateTransfer(String id, {int? maxWaitMinutes, bool? isEnabled, TransferPriority? priority}) {
     final index = transferNodes.indexWhere((t) => t.id == id);
     if (index >= 0) {
       transferNodes[index] = transferNodes[index].copyWith(
         maxWaitMinutes: maxWaitMinutes,
         isEnabled: isEnabled,
+        priority: priority,
       );
       _invalidateGeneratedTimetable();
       notifyListeners();
@@ -275,7 +353,7 @@ class AppState extends ChangeNotifier {
 
     try {
       await Future<void>.delayed(const Duration(milliseconds: 1));
-      generatedJobs = _generator.generateTimetable(
+      generatedJobs = await _generator.generateTimetable(
         routes: routes,
         stops: stops,
         transferNodes: transferNodes,
@@ -284,6 +362,17 @@ class AppState extends ChangeNotifier {
 
       isTimetableGenerated = generatedJobs.isNotEmpty;
       _updateVehicles();
+
+      // Feed simulation service
+      if (isTimetableGenerated) {
+        final vehicleShifts = _generator.getVehicleShifts(generatedJobs);
+        simulationService.load(
+          jobs: generatedJobs,
+          stops: stops,
+          vehicleJobs: vehicleShifts,
+        );
+      }
+
       return generatedJobs.length;
     } catch (e, stack) {
       generationError = 'Chyba generování: $e';

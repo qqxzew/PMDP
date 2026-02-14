@@ -78,15 +78,28 @@ class LinesScreen extends StatelessWidget {
                   OutlinedButton.icon(
                     onPressed: state.routes.isEmpty
                         ? null
-                        : () {
+                        : () async {
                             final used = state.autoAssignBusesByPriority();
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
                                 content: Text(
-                                    'Auto rozdělení hotovo: $used z ${state.totalAvailableBuses} autobusů'),
+                                    'Auto rozdělení hotovo: $used z ${state.totalAvailableBuses} autobusů. Generování jízdních řádů...'),
                                 backgroundColor: AppTheme.success,
+                                duration: const Duration(seconds: 2),
                               ),
                             );
+                            
+                            // Automaticky generovat jízdní řády
+                            final jobsCount = await state.generateTimetable();
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                      'Jízdní řády vygenerovány: $jobsCount jízd'),
+                                  backgroundColor: AppTheme.success,
+                                ),
+                              );
+                            }
                           },
                     icon: const Icon(Icons.auto_awesome, size: 18),
                     label: const Text('Auto rozdělit'),

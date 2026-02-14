@@ -1,13 +1,25 @@
 import 'dart:math' as math;
-
 import 'package:uuid/uuid.dart';
 import '../models/gtfs_models.dart';
 import '../models/transfer_node.dart';
+import 'live_simulation_engine.dart';
 
 /// Service for managing transfer nodes between lines
 class TransferManager {
   static const _uuid = Uuid();
   static const double _parallelThresholdMeters = 300;
+  
+  // Optional engine for real-time state
+  LiveSimulationEngine? simulationEngine;
+
+  TransferManager([this.simulationEngine]);
+
+  /// Calculate synchronized departure time: T_meet = max(T_arr1, T_arr2) + buffer
+  DateTime calculateMeetTime(DateTime arrival1, DateTime arrival2, {int bufferMinutes = 2}) {
+     final buffer = Duration(minutes: bufferMinutes);
+     final maxTime = arrival1.isAfter(arrival2) ? arrival1 : arrival2;
+     return maxTime.add(buffer);
+  }
 
   /// Automatically detect transfer nodes where lines share stops
   List<TransferNode> detectAutomaticTransfers({

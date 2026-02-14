@@ -100,10 +100,16 @@ class AppSidebar extends StatelessWidget {
             onTap: () => onItemSelected(4),
           ),
           _NavItem(
-            icon: Icons.message_outlined,
-            label: 'Zprávy',
+            icon: Icons.access_time,
+            label: 'Směny řidičů',
             isSelected: selectedIndex == 5,
             onTap: () => onItemSelected(5),
+          ),
+          _NavItem(
+            icon: Icons.message_outlined,
+            label: 'Zprávy',
+            isSelected: selectedIndex == 6,
+            onTap: () => onItemSelected(6),
             badge: unreadMessages > 0 ? unreadMessages : null,
           ),
           const Spacer(),
