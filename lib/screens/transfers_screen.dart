@@ -10,6 +10,12 @@ import '../models/transfer_node.dart';
 import '../providers/app_state.dart';
 import '../theme/app_theme.dart';
 
+enum RouteDirection {
+  forward,
+  backward,
+  both,
+}
+
 class TransfersScreen extends StatefulWidget {
   const TransfersScreen({super.key});
 
@@ -17,7 +23,10 @@ class TransfersScreen extends StatefulWidget {
   State<TransfersScreen> createState() => _TransfersScreenState();
 }
 
-class _TransfersScreenState extends State<TransfersScreen> {
+class _TransfersScreenState extends State<TransfersScreen> with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+  
   static const _routeColors = [
     Color(0xFFE53E3E),
     Color(0xFF3182CE),
@@ -34,6 +43,7 @@ class _TransfersScreenState extends State<TransfersScreen> {
   ];
 
   final Map<String, List<LatLng>> _routeGeometry = {};
+  final Map<String, List<LatLng>> _transferRouteGeometry = {}; // Cache for transfer node routes
   final Set<String> _activeLineNumbers = {};
 
   // Selection state for creating transfers
@@ -47,6 +57,13 @@ class _TransfersScreenState extends State<TransfersScreen> {
 
   bool _showLayers = false;
   bool _showTransferNodes = true;
+  RouteDirection _routeDirection = RouteDirection.forward;
+  
+  // Loading progress tracking
+  bool _isLoadingRoutes = false;
+  double _loadingProgress = 0.0;
+  int _totalRoutesToLoad = 0;
+  int _loadedRoutes = 0;
 
   @override
   void didChangeDependencies() {
@@ -54,6 +71,8 @@ class _TransfersScreenState extends State<TransfersScreen> {
     final state = context.read<AppState>();
     if (_activeLineNumbers.isEmpty) {
       _activeLineNumbers.addAll(state.routes.map((r) => r.route.routeShortName));
+      // Загрузка маршрутов при первом открытии экрана
+      Future.microtask(() => _warmupRouteGeometry(state));
     }
   }
 
@@ -62,31 +81,113 @@ class _TransfersScreenState extends State<TransfersScreen> {
     Set<String>? onlyLines,
   }) async {
     final routing = state.osrmRoutingService;
-    for (final route in state.routes) {
+    
+    // Calculate total routes to load
+    final routesToLoad = state.routes.where((r) => 
+      onlyLines == null || onlyLines.contains(r.route.routeShortName)
+    ).toList();
+    
+    _totalRoutesToLoad = routesToLoad.length * 2; // forward + backward
+    _loadedRoutes = 0;
+    
+    if (mounted) {
+      setState(() {
+        _isLoadingRoutes = true;
+        _loadingProgress = 0.0;
+      });
+    }
+    
+    for (final route in routesToLoad) {
       final line = route.route.routeShortName;
-      if (onlyLines != null && !onlyLines.contains(line)) continue;
       final fwd = _stopTimesToPoints(route.forwardStopTimes, state.stops);
       final bwd = _stopTimesToPoints(route.backwardStopTimes, state.stops);
+      
       if (fwd.length >= 2) {
-        final key = 'line:$line:0';        final poly = await routing.getRoutePolyline(
-          cacheKey: key,
-          waypoints: fwd,
-        );
-        if (mounted) setState(() => _routeGeometry[key] = poly);
+        final key = 'line:$line:0';
+        try {
+          final poly = await routing.getRoutePolyline(
+            cacheKey: key,
+            waypoints: fwd,
+          );
+          if (mounted) {
+            setState(() {
+              _routeGeometry[key] = poly;
+              _loadedRoutes++;
+              _loadingProgress = _loadedRoutes / _totalRoutesToLoad;
+            });
+          }
+          // Задержка 500мс между запросами
+          await Future.delayed(const Duration(milliseconds: 500));
+        } catch (e) {
+          if (mounted) {
+            setState(() {
+              _loadedRoutes++;
+              _loadingProgress = _loadedRoutes / _totalRoutesToLoad;
+            });
+          }
+        }
       }
+      
       if (bwd.length >= 2) {
         final key = 'line:$line:1';
-        final poly = await routing.getRoutePolyline(
-          cacheKey: key,
-          waypoints: bwd,
-        );
-        if (mounted) setState(() => _routeGeometry[key] = poly);
+        try {
+          final poly = await routing.getRoutePolyline(
+            cacheKey: key,
+            waypoints: bwd,
+          );
+          if (mounted) {
+            setState(() {
+              _routeGeometry[key] = poly;
+              _loadedRoutes++;
+              _loadingProgress = _loadedRoutes / _totalRoutesToLoad;
+            });
+          }
+          // Задержка 500мс между запросами
+          await Future.delayed(const Duration(milliseconds: 500));
+        } catch (e) {
+          if (mounted) {
+            setState(() {
+              _loadedRoutes++;
+              _loadingProgress = _loadedRoutes / _totalRoutesToLoad;
+            });
+          }
+        }
+      }
+    }
+    
+    if (mounted) {
+      setState(() {
+        _isLoadingRoutes = false;
+        _loadingProgress = 1.0;
+      });
+    }
+  }
+
+  Future<void> _loadTransferRoute(AppState state, String nodeId, LatLng p1, LatLng p2) async {
+    final routing = state.osrmRoutingService;
+    final key = 'transfer:$nodeId';
+    
+    try {
+      final poly = await routing.getRoutePolyline(
+        cacheKey: key,
+        waypoints: [p1, p2],
+      );
+      if (mounted && poly.length >= 2) {
+        setState(() => _transferRouteGeometry[key] = poly);
+      }
+      // Задержка 500мс между запросами
+      await Future.delayed(const Duration(milliseconds: 500));
+    } catch (e) {
+      // Fallback to direct line on error
+      if (mounted) {
+        setState(() => _transferRouteGeometry[key] = [p1, p2]);
       }
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // Keep alive
     return Consumer<AppState>(
       builder: (context, state, _) {
         return Row(
@@ -436,12 +537,16 @@ class _TransfersScreenState extends State<TransfersScreen> {
       maxWaitMinutes: _syncGapMinutes,
     );
     
-    // Инвалидируем кэш геометрии маршрутов для перезагрузки
-    _routeGeometry.clear();
-    
-    // Сохраняем значения перед сбросом для использования в Future
+    // Инвалидируем кэш геометрии маршрутов только для затронутых линий
     final line1 = _selectedLine1;
     final line2 = _selectedLine2;
+    
+    if (line1 != null && line2 != null) {
+      _routeGeometry.remove('line:$line1:0');
+      _routeGeometry.remove('line:$line1:1');
+      _routeGeometry.remove('line:$line2:0');
+      _routeGeometry.remove('line:$line2:1');
+    }
     
     // Reset selection
     setState(() {
@@ -453,10 +558,12 @@ class _TransfersScreenState extends State<TransfersScreen> {
     // Перезагружаем геометрию только для измененных линий
     if (line1 != null && line2 != null) {
       Future.delayed(const Duration(milliseconds: 500), () {
-        _warmupRouteGeometry(
-          state,
-          onlyLines: {line1, line2},
-        );
+        if (mounted) {
+          _warmupRouteGeometry(
+            state,
+            onlyLines: {line1, line2},
+          );
+        }
       });
     }
     
@@ -473,13 +580,25 @@ class _TransfersScreenState extends State<TransfersScreen> {
     final visibleRoutes = state.routes
         .where((r) => _activeLineNumbers.contains(r.route.routeShortName))
         .toList();
+    
+    // Check if we have selected lines for transfer creation
+    final hasSelectedLines = _selectedLine1 != null || _selectedLine2 != null;
+    final selectedLines = {
+      if (_selectedLine1 != null) _selectedLine1!,
+      if (_selectedLine2 != null) _selectedLine2!,
+    };
 
     final polylines = <Polyline>[];
     for (int i = 0; i < state.routes.length; i++) {
       final route = state.routes[i];
       final line = route.route.routeShortName;
       if (!_activeLineNumbers.contains(line)) continue;
+      
+      // Check if this line is selected
+      final isSelected = !hasSelectedLines || selectedLines.contains(line);
       final color = _routeColors[i % _routeColors.length];
+      final displayColor = isSelected ? color : color.withValues(alpha: 0.2);
+      final strokeWidth = isSelected ? 5.0 : 2.0;
 
       final fwdKey = 'line:$line:0';
       final bwdKey = 'line:$line:1';
@@ -487,30 +606,42 @@ class _TransfersScreenState extends State<TransfersScreen> {
       final fwd = _routeGeometry[fwdKey] ?? _stopTimesToPoints(route.forwardStopTimes, state.stops);
       final bwd = _routeGeometry[bwdKey] ?? _stopTimesToPoints(route.backwardStopTimes, state.stops);
 
-      if (fwd.length >= 2) {
-        polylines.add(Polyline(points: fwd, color: color, strokeWidth: 4));
+      // Show routes based on selected direction
+      if ((_routeDirection == RouteDirection.forward || _routeDirection == RouteDirection.both) && fwd.length >= 2) {
+        polylines.add(Polyline(
+          points: fwd,
+          color: displayColor,
+          strokeWidth: _routeDirection == RouteDirection.both ? (isSelected ? strokeWidth * 0.7 : strokeWidth * 0.5) : strokeWidth,
+        ));
       }
-      if (bwd.length >= 2) {
+      if ((_routeDirection == RouteDirection.backward || _routeDirection == RouteDirection.both) && bwd.length >= 2) {
         polylines.add(Polyline(
           points: bwd,
-          color: color.withValues(alpha: 0.65),
-          strokeWidth: 3,
-          pattern: const StrokePattern.dotted(),
+          color: _routeDirection == RouteDirection.both ? displayColor.withValues(alpha: 0.65) : displayColor,
+          strokeWidth: _routeDirection == RouteDirection.both ? (isSelected ? strokeWidth * 0.6 : strokeWidth * 0.4) : strokeWidth,
+          pattern: _routeDirection == RouteDirection.both ? const StrokePattern.dotted() : const StrokePattern.solid(),
         ));
       }
     }
 
     final stopMarkers = <Marker>[];
     for (final route in visibleRoutes) {
+      final line = route.route.routeShortName;
+      final isLineSelected = !hasSelectedLines || selectedLines.contains(line);
+      
       for (final stopId in route.allStopIds) {
         final stop = state.stops[stopId];
         if (stop == null || stop.stopLat == 0 || stop.stopLon == 0) continue;
+        
+        // Не показуємо остановки невыбраних линій
+        if (!isLineSelected && hasSelectedLines) continue;
+        
         final pickType = _pickTypeForStop(stopId);
         stopMarkers.add(
           Marker(
             point: LatLng(stop.stopLat, stop.stopLon),
-            width: 18,
-            height: 18,
+            width: pickType == _PickType.none ? 12 : 24,
+            height: pickType == _PickType.none ? 12 : 24,
             child: GestureDetector(
               onTap: () => _handleStopTap(route.route.routeShortName, stopId, stop.stopName, state),
               child: Container(
@@ -518,9 +649,16 @@ class _TransfersScreenState extends State<TransfersScreen> {
                   shape: BoxShape.circle,
                   color: pickType == _PickType.none ? Colors.white : AppTheme.primary,
                   border: Border.all(
-                    color: pickType == _PickType.none ? const Color(0xFF4A5568) : AppTheme.primary,
-                    width: 2,
+                    color: pickType == _PickType.none ? const Color(0xFF3182CE) : AppTheme.primary,
+                    width: pickType == _PickType.none ? 2 : 3,
                   ),
+                  boxShadow: pickType != _PickType.none ? [
+                    BoxShadow(
+                      color: AppTheme.primary.withValues(alpha: 0.4),
+                      blurRadius: 6,
+                      spreadRadius: 2,
+                    ),
+                  ] : null,
                 ),
                 child: pickType == _PickType.none
                     ? null
@@ -528,7 +666,7 @@ class _TransfersScreenState extends State<TransfersScreen> {
                         child: Text(
                           pickType == _PickType.a ? 'A' : 'B',
                           style: const TextStyle(
-                            fontSize: 10,
+                            fontSize: 12,
                             fontWeight: FontWeight.w700,
                             color: Colors.white,
                           ),
@@ -553,26 +691,41 @@ class _TransfersScreenState extends State<TransfersScreen> {
         final p2 = LatLng(s2.stopLat, s2.stopLon);
 
         if (node.stopId1 != node.stopId2) {
+          // Load route via OSRM for transfer connections
+          final transferKey = 'transfer:${node.id}';
+          if (!_transferRouteGeometry.containsKey(transferKey)) {
+            // Schedule async load
+            _loadTransferRoute(state, node.id, p1, p2);
+          }
+          
+          final routePoints = _transferRouteGeometry[transferKey] ?? [p1, p2];
           nodePolylines.add(
             Polyline(
-              points: [p1, p2],
-              color: const Color(0xFF2D3748),
-              strokeWidth: 2,
-              pattern: StrokePattern.dashed(segments: [8, 5]),
+              points: routePoints,
+              color: const Color(0xFF16A34A),
+              strokeWidth: 3,
+              pattern: StrokePattern.dashed(segments: [10, 6]),
             ),
           );
         }
         nodeMarkers.add(
           Marker(
             point: p1,
-            width: 16,
-            height: 16,
+            width: 20,
+            height: 20,
             child: Container(
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: Colors.white,
-                border: Border.all(color: const Color(0xFF2D3748), width: 2),
+                color: const Color(0xFF16A34A),
+                border: Border.all(color: Colors.white, width: 2),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.2),
+                    blurRadius: 3,
+                  ),
+                ],
               ),
+              child: const Icon(Icons.sync_alt, size: 10, color: Colors.white),
             ),
           ),
         );
@@ -602,20 +755,122 @@ class _TransfersScreenState extends State<TransfersScreen> {
         Positioned(
           top: 12,
           right: 12,
-          child: FloatingActionButton.small(
-            heroTag: 'layersPanel',
-            backgroundColor: Colors.white,
-            onPressed: () => setState(() => _showLayers = !_showLayers),
-            child: const Icon(Icons.layers_outlined, color: AppTheme.textPrimary),
+          child: Column(
+            children: [
+              Tooltip(
+                message: _routeDirection == RouteDirection.forward
+                    ? 'Směr tam'
+                    : _routeDirection == RouteDirection.backward
+                        ? 'Směr zpět'
+                        : 'Oba směry',
+                child: FloatingActionButton.small(
+                  heroTag: 'directionToggle',
+                  backgroundColor: Colors.white,
+                  onPressed: () {
+                    setState(() {
+                      _routeDirection = switch (_routeDirection) {
+                        RouteDirection.forward => RouteDirection.backward,
+                        RouteDirection.backward => RouteDirection.both,
+                        RouteDirection.both => RouteDirection.forward,
+                      };
+                    });
+                  },
+                  child: Icon(
+                    _routeDirection == RouteDirection.forward
+                        ? Icons.arrow_forward
+                        : _routeDirection == RouteDirection.backward
+                            ? Icons.arrow_back
+                            : Icons.sync_alt,
+                    color: AppTheme.primary,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              FloatingActionButton.small(
+                heroTag: 'layersPanel',
+                backgroundColor: Colors.white,
+                onPressed: () => setState(() => _showLayers = !_showLayers),
+                child: const Icon(Icons.layers_outlined, color: AppTheme.textPrimary),
+              ),
+            ],
           ),
         ),
         if (_showLayers)
           Positioned(
-            top: 60,
+            top: 108,
             right: 12,
             width: 230,
             bottom: 24,
             child: _buildLayersPanel(state),
+          ),
+        // Loading progress indicator
+        if (_isLoadingRoutes)
+          Positioned(
+            bottom: 20,
+            left: 20,
+            right: 20,
+            child: Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.95),
+                borderRadius: BorderRadius.circular(12),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.15),
+                    blurRadius: 10,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Načítání tras...',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: AppTheme.textPrimary,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${(_loadingProgress * 100).toInt()}% • $_loadedRoutes/$_totalRoutesToLoad',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: AppTheme.textMuted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: LinearProgressIndicator(
+                      value: _loadingProgress,
+                      minHeight: 6,
+                      backgroundColor: AppTheme.border,
+                      valueColor: const AlwaysStoppedAnimation<Color>(AppTheme.primary),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
       ],
     );
@@ -763,6 +1018,31 @@ class _TransfersScreenState extends State<TransfersScreen> {
         maxWaitMinutes: result['maxWait'] as int,
         priority: result['priority'] as TransferPriority,
       );
+      
+      // Инвалидируем кэш и перегенерируем маршруты для затронутых линий
+      final affectedLines = {a.lineNumber, b.lineNumber};
+      for (final line in affectedLines) {
+        _routeGeometry.remove('line:$line:0');
+        _routeGeometry.remove('line:$line:1');
+      }
+      
+      // Перезагружаем геометрию для измененных линий
+      Future.delayed(const Duration(milliseconds: 500), () {
+        if (mounted) {
+          _warmupRouteGeometry(
+            state,
+            onlyLines: affectedLines,
+          );
+        }
+      });
+      
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Přestupní uzel vytvořen - trasy se aktualizují'),
+          duration: Duration(seconds: 3),
+        ),
+      );
     }
 
     _resetPicks();
@@ -803,20 +1083,28 @@ class _TransferTableRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final state = context.read<AppState>();
     return Container(
-      padding: const EdgeInsets.all(10),
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(8),
         border: Border.all(color: AppTheme.border),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.03),
+            blurRadius: 4,
+            offset: const Offset(0, 2),
+          ),
+        ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Header with lines and switch
           Row(
             children: [
               _LineChip(line: transfer.lineNumber1),
               const SizedBox(width: 6),
-              const Icon(Icons.swap_horiz, size: 14, color: AppTheme.textMuted),
+              const Icon(Icons.swap_horiz, size: 16, color: AppTheme.textMuted),
               const SizedBox(width: 6),
               _LineChip(line: transfer.lineNumber2),
               const Spacer(),
@@ -826,51 +1114,81 @@ class _TransferTableRow extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 6),
-          Text(
-            '${transfer.stopName1} ↔ ${transfer.stopName2}',
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
+          const SizedBox(height: 10),
+          // Stops display - each on separate line
+          _StopDisplayRow(
+            icon: Icons.radio_button_checked,
+            label: 'Zastávka A:',
+            stopName: transfer.stopName1,
+            lineNumber: transfer.lineNumber1,
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
+          _StopDisplayRow(
+            icon: Icons.radio_button_checked,
+            label: 'Zastávka B:',
+            stopName: transfer.stopName2,
+            lineNumber: transfer.lineNumber2,
+          ),
+          const SizedBox(height: 10),
+          const Divider(height: 1),
+          const SizedBox(height: 10),
+          // Settings section
           Row(
             children: [
-              const Text('maxWait:', style: TextStyle(fontSize: 12, color: AppTheme.textMuted)),
-              const SizedBox(width: 8),
-              SizedBox(
-                width: 64,
-                child: TextFormField(
-                  initialValue: transfer.maxWaitMinutes.toString(),
-                  keyboardType: TextInputType.number,
-                  textAlign: TextAlign.center,
-                  decoration: const InputDecoration(
-                    isDense: true,
-                    contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                    border: OutlineInputBorder(),
-                  ),
-                  onFieldSubmitted: (v) {
-                    final parsed = int.tryParse(v);
-                    if (parsed != null) {
-                      state.updateTransfer(transfer.id, maxWaitMinutes: parsed.clamp(1, 20));
-                    }
-                  },
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Max čekání:', style: TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 4),
+                    SizedBox(
+                      height: 36,
+                      child: TextFormField(
+                        initialValue: transfer.maxWaitMinutes.toString(),
+                        keyboardType: TextInputType.number,
+                        textAlign: TextAlign.center,
+                        decoration: InputDecoration(
+                          isDense: true,
+                          suffixText: 'min',
+                          suffixStyle: const TextStyle(fontSize: 11, color: AppTheme.textMuted),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                          border: const OutlineInputBorder(),
+                        ),
+                        onFieldSubmitted: (v) {
+                          final parsed = int.tryParse(v);
+                          if (parsed != null) {
+                            state.updateTransfer(transfer.id, maxWaitMinutes: parsed.clamp(1, 20));
+                          }
+                        },
+                      ),
+                    ),
+                  ],
                 ),
               ),
               const SizedBox(width: 12),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                 decoration: BoxDecoration(
                   color: transfer.isEnabled ? AppTheme.success.withValues(alpha: 0.14) : AppTheme.warning.withValues(alpha: 0.14),
-                  borderRadius: BorderRadius.circular(4),
+                  borderRadius: BorderRadius.circular(6),
                 ),
-                child: Text(
-                  transfer.isEnabled ? 'Sync' : 'Wait',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    color: transfer.isEnabled ? AppTheme.success : AppTheme.warning,
-                  ),
+                child: Column(
+                  children: [
+                    Icon(
+                      transfer.isEnabled ? Icons.sync : Icons.pause,
+                      size: 20,
+                      color: transfer.isEnabled ? AppTheme.success : AppTheme.warning,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      transfer.isEnabled ? 'Sync' : 'Wait',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w700,
+                        color: transfer.isEnabled ? AppTheme.success : AppTheme.warning,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -1059,4 +1377,63 @@ class _MapPick {
     required this.stopId,
     required this.stopName,
   });
+}
+
+// Helper widget for stop display
+class _StopDisplayRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String stopName;
+  final String lineNumber;
+
+  const _StopDisplayRow({
+    required this.icon,
+    required this.label,
+    required this.stopName,
+    required this.lineNumber,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 14, color: AppTheme.primary),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: const TextStyle(fontSize: 10, color: AppTheme.textMuted, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                stopName,
+                style: const TextStyle(fontSize: 12, color: AppTheme.textPrimary, fontWeight: FontWeight.w500),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        ),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          decoration: BoxDecoration(
+            color: AppTheme.primary.withValues(alpha: 0.1),
+            borderRadius: BorderRadius.circular(3),
+          ),
+          child: Text(
+            'L$lineNumber',
+            style: const TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w600,
+              color: AppTheme.primary,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }

@@ -18,11 +18,15 @@ class VehicleMapScreen extends StatefulWidget {
   State<VehicleMapScreen> createState() => _VehicleMapScreenState();
 }
 
-class _VehicleMapScreenState extends State<VehicleMapScreen> {
+class _VehicleMapScreenState extends State<VehicleMapScreen> with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+  
   final Set<String> _selectedLineNumbers = {}; // Изначально пусто - карта пустая
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // Keep alive
     return Consumer<AppState>(
       builder: (context, state, _) {
         if (!state.isTimetableGenerated || state.vehicles.isEmpty) {
@@ -414,6 +418,9 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
   // OSRM polylines cache: "routeId_direction" -> List<LatLng>
   final Map<String, List<LatLng>> _osrmPolylines = {};
   bool _isLoadingOsrmRoutes = false;
+  double _loadingProgress = 0.0;
+  int _totalRoutesToLoad = 0;
+  int _loadedRoutes = 0;
 
   static const _routeColors = [
     Color(0xFFE53E3E), Color(0xFF3182CE), Color(0xFF38A169), Color(0xFFD69E2E),
@@ -464,15 +471,24 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
   // Загружаем маршруты для выбранных линий из Mapbox
   Future<void> _loadOsrmRoutesForSelected() async {
     if (_isLoadingOsrmRoutes) return;
-    _isLoadingOsrmRoutes = true;
+    
+    final selectedRoutes = widget.routes.where((route) {
+      return widget.selectedLineNumbers.contains(route.route.routeShortName);
+    }).toList();
+
+    if (selectedRoutes.isEmpty) return;
+    
+    _totalRoutesToLoad = selectedRoutes.length * 2; // forward + backward
+    _loadedRoutes = 0;
+    
+    if (mounted) {
+      setState(() {
+        _isLoadingOsrmRoutes = true;
+        _loadingProgress = 0.0;
+      });
+    }
 
     try {
-      final selectedRoutes = widget.routes.where((route) {
-        return widget.selectedLineNumbers.contains(route.route.routeShortName);
-      }).toList();
-
-      if (selectedRoutes.isEmpty) return;
-
       debugPrint('🌐 Загрузка маршрутов Mapbox для ${selectedRoutes.length} линий...');
       
       for (final route in selectedRoutes) {
@@ -509,19 +525,35 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
             ).timeout(const Duration(seconds: 25));
 
             if (polyline.length >= 2 && mounted) {
-              _osrmPolylines[key] = polyline;
+              setState(() {
+                _osrmPolylines[key] = polyline;
+                _loadedRoutes++;
+                _loadingProgress = _loadedRoutes / _totalRoutesToLoad;
+              });
               debugPrint('✅ Mapbox: ${route.route.routeShortName} направление $dir (${polyline.length} точек)');
-              if (mounted) setState(() {});
             }
+            // Задержка 500мс между запросами
+            await Future.delayed(const Duration(milliseconds: 500));
           } catch (e) {
             debugPrint('⚠️ Mapbox ошибка для ${route.route.routeShortName}: $e');
-            _osrmPolylines[key] = waypoints;
-            if (mounted) setState(() {});
+            if (mounted) {
+              setState(() {
+                _osrmPolylines[key] = waypoints;
+                _loadedRoutes++;
+                _loadingProgress = _loadedRoutes / _totalRoutesToLoad;
+              });
+            }
+            await Future.delayed(const Duration(milliseconds: 500));
           }
         }
       }
     } finally {
-      _isLoadingOsrmRoutes = false;
+      if (mounted) {
+        setState(() {
+          _isLoadingOsrmRoutes = false;
+          _loadingProgress = 1.0;
+        });
+      }
     }
   }
 
@@ -554,14 +586,22 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
     final polylines = <Polyline>[];
     final allRoutes = widget.routes;
     
+    // Определяем есть ли выбранные линии
+    final hasSelectedLines = _visibleRouteIds.isNotEmpty;
+    
     for (int i = 0; i < allRoutes.length; i++) {
       final route = allRoutes[i];
       final lineNumber = route.route.routeShortName;
+      final routeId = route.route.routeId;
       
-      // Показываем линии ТОЛЬКО если они выбраны
-      if (widget.selectedLineNumbers.isEmpty || !widget.selectedLineNumbers.contains(lineNumber)) continue;
+      // Проверяем выбрана ли эта линия
+      final isSelected = _visibleRouteIds.contains(routeId);
       
-      final color = _routeColors[i % _routeColors.length];
+      // Если есть выбранные линии и эта не выбрана - делаем серой
+      final baseColor = _routeColors[i % _routeColors.length];
+      final displayColor = (hasSelectedLines && !isSelected) ? Colors.grey : baseColor;
+      final opacity = (hasSelectedLines && !isSelected) ? 0.2 : 1.0;
+      final strokeWidth = (hasSelectedLines && isSelected) ? 5.0 : 2.0;
 
       for (final dir in [0, 1]) {
         final key = '${route.route.routeId}_$dir';
@@ -577,11 +617,10 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
         }
 
         if (pts.length >= 2) {
-          // Простая отрисовка: направление 0 - сплошная жирная линия, направление 1 - пунктир
           polylines.add(Polyline(
             points: pts,
-            color: dir == 0 ? color : color.withValues(alpha: 0.65),
-            strokeWidth: dir == 0 ? 4.5 : 3.5,
+            color: dir == 0 ? displayColor.withValues(alpha: opacity) : displayColor.withValues(alpha: opacity * 0.65),
+            strokeWidth: dir == 0 ? strokeWidth : strokeWidth * 0.7,
             pattern: dir == 0 ? const StrokePattern.solid() : const StrokePattern.dotted(),
           ));
         }
@@ -591,9 +630,9 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
     // ── Stop markers (only for selected lines) ──
     final activeStopIds = <String>{};
     for (final route in allRoutes) {
-      final lineNumber = route.route.routeShortName;
-      // Показуємо зупинки тільки для вибраних ліній
-      if (widget.selectedLineNumbers.isEmpty || !widget.selectedLineNumbers.contains(lineNumber)) continue;
+      final routeId = route.route.routeId;
+      // Показываем только остановки выбранных линий
+      if (hasSelectedLines && !_visibleRouteIds.contains(routeId)) continue;
       activeStopIds.addAll(route.allStopIds);
     }
     final stopMarkers = <Marker>[];
@@ -623,8 +662,14 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
     if (sim.isRunning && simPositions.isNotEmpty) {
       // Use live simulation positions
       for (final vp in simPositions.values) {
-        // Фильтр по выбранным линиям (показуємо тільки вибрані)
-        if (widget.selectedLineNumbers.isEmpty || !widget.selectedLineNumbers.contains(vp.lineNumber)) continue;
+        // Фильтр по выбранным линиям
+        if (hasSelectedLines) {
+          final vehicleRoute = allRoutes.firstWhere(
+            (r) => r.route.routeShortName == vp.lineNumber,
+            orElse: () => allRoutes.first,
+          );
+          if (!_visibleRouteIds.contains(vehicleRoute.route.routeId)) continue;
+        }
         
         vehicleMarkers.add(Marker(
           point: vp.position,
@@ -658,8 +703,14 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
     } else {
       // Static fallback
       for (final v in widget.allVehicles) {
-        // Фильтр по выбранным линиям (показуємо тільки вибрані)
-        if (widget.selectedLineNumbers.isEmpty || !widget.selectedLineNumbers.contains(v.currentLineNumber)) continue;
+        // Фильтр по выбранным линиям
+        if (hasSelectedLines) {
+          final vehicleRoute = allRoutes.firstWhere(
+            (r) => r.route.routeShortName == v.currentLineNumber,
+            orElse: () => allRoutes.first,
+          );
+          if (!_visibleRouteIds.contains(vehicleRoute.route.routeId)) continue;
+        }
         
         if (v.currentStopName == null) continue;
         final stopMatch = widget.stops.values.where((s) => s.stopName == v.currentStopName).firstOrNull;
@@ -775,28 +826,70 @@ class _VehicleMapViewState extends State<_VehicleMapView> {
             ),
           ),
 
-        // ── Loading indicator ──
+        // ── Loading progress indicator ──
         if (_isLoadingOsrmRoutes)
           Positioned(
-            bottom: 20, left: 20,
+            bottom: 20,
+            left: 20,
+            right: 20,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.95),
-                borderRadius: BorderRadius.circular(8),
-                boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.2), blurRadius: 8)],
+                borderRadius: BorderRadius.circular(12),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.15),
+                    blurRadius: 10,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
               ),
-              child: Row(
+              child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  SizedBox(
-                    width: 20, height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.primary),
+                  Row(
+                    children: [
+                      const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Načítání tras...',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: AppTheme.textPrimary,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${(_loadingProgress * 100).toInt()}% • $_loadedRoutes/$_totalRoutesToLoad',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: AppTheme.textMuted,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 12),
-                  Text(
-                    'Загрузка маршрутів...',
-                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: AppTheme.textPrimary),
+                  const SizedBox(height: 12),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: LinearProgressIndicator(
+                      value: _loadingProgress,
+                      minHeight: 6,
+                      backgroundColor: AppTheme.border,
+                      valueColor: const AlwaysStoppedAnimation<Color>(AppTheme.primary),
+                    ),
                   ),
                 ],
               ),

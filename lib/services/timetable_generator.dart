@@ -99,75 +99,75 @@ class TimetableGenerator {
     if (baseInterval <= 0) return jobs;
 
     final busCount = route.assignedBuses;
-    final halfBuses = (busCount / 2).ceil();
-    final otherHalf = busCount - halfBuses;
-
+    
     // Assign vehicle IDs
     final vehicleIds = List.generate(
         busCount, (i) => 'V${route.route.routeShortName}-${i + 1}');
 
-    // Generate departures for 24 hours (0:00 - 23:59)
-    // First, generate departure times respecting demand
-    final forwardDepartures = _generateDepartureTimes(
-      baseInterval: baseInterval,
-      startHour: 4, // First service at 4:00
-      endHour: 24, // Last departure
-    );
-
-    final backwardDepartures = _generateDepartureTimes(
-      baseInterval: baseInterval,
-      startHour: 4,
-      endHour: 24,
-    );
-
-    // Offset backward departures by half interval for better coverage
-    final halfOffset = Duration(minutes: baseInterval ~/ 2);
-    final adjustedBackwardDepartures =
-        backwardDepartures.map((d) => d + halfOffset).toList();
-
-    // Distribute jobs among vehicles (round-robin)
-    int vehicleIndex = 0;
+    // Calculate trip duration for each direction
+    final forwardDuration = _calculateTripDuration(route.forwardStopTimes);
+    final backwardDuration = _calculateTripDuration(route.backwardStopTimes);
     
-    // Forward direction trips
-    for (int i = 0; i < forwardDepartures.length; i++) {
-      final departure = forwardDepartures[i];
-      final vid = vehicleIds[vehicleIndex % halfBuses];
+    // Turnaround time at terminus (rest/recovery time)
+    const turnaroundMinutes = 5;
+    
+    // Calculate cycle time (round trip time)
+    final cycleTime = forwardDuration.inMinutes + backwardDuration.inMinutes + (turnaroundMinutes * 2);
+    
+    // Service hours (4:00 - 24:00)
+    const startHour = 4;
+    const endHour = 24;
+    const serviceMinutes = (endHour - startHour) * 60;
+    
+    // Stagger vehicle start times to maintain frequency
+    final startTimeOffset = cycleTime ~/ busCount;
+    
+    // Generate jobs for each vehicle
+    for (int busIndex = 0; busIndex < busCount; busIndex++) {
+      final vehicleId = vehicleIds[busIndex];
       
-      final job = _createJob(
-        route: route,
-        stops: stops,
-        operationDate: operationDate,
-        departureOffset: departure,
-        directionId: 0,
-        vehicleId: vid,
-      );
-      if (job != null) jobs.add(job);
+      // Staggered start time for this vehicle
+      var currentTime = Duration(minutes: startHour * 60 + (busIndex * startTimeOffset));
+      var currentDirection = 0; // Start with forward direction
       
-      vehicleIndex++;
-    }
-
-    // Backward direction trips
-    vehicleIndex = 0;
-    for (int i = 0; i < adjustedBackwardDepartures.length; i++) {
-      final departure = adjustedBackwardDepartures[i];
-      final vid = otherHalf > 0
-          ? vehicleIds[halfBuses + (vehicleIndex % otherHalf)]
-          : vehicleIds[vehicleIndex % halfBuses];
-      
-      final job = _createJob(
-        route: route,
-        stops: stops,
-        operationDate: operationDate,
-        departureOffset: departure,
-        directionId: 1,
-        vehicleId: vid,
-      );
-      if (job != null) jobs.add(job);
-      
-      vehicleIndex++;
+      // Generate trips for this vehicle throughout the day
+      while (currentTime.inMinutes < endHour * 60) {
+        final job = _createJob(
+          route: route,
+          stops: stops,
+          operationDate: operationDate,
+          departureOffset: currentTime,
+          directionId: currentDirection,
+          vehicleId: vehicleId,
+        );
+        
+        if (job != null) {
+          jobs.add(job);
+          
+          // Calculate next departure time
+          final tripDuration = currentDirection == 0 ? forwardDuration : backwardDuration;
+          currentTime = currentTime + tripDuration + const Duration(minutes: turnaroundMinutes);
+          
+          // Alternate direction (round trip logic)
+          currentDirection = currentDirection == 0 ? 1 : 0;
+        } else {
+          break;
+        }
+      }
     }
 
     return jobs;
+  }
+  
+  /// Calculate trip duration from stop times
+  Duration _calculateTripDuration(List<GtfsStopTime> stopTimes) {
+    if (stopTimes.isEmpty) return Duration.zero;
+    
+    final firstStop = stopTimes.first;
+    final lastStop = stopTimes.last;
+    
+    final duration = lastStop.arrivalTime - firstStop.departureTime;
+    return duration;
   }
 
   /// Generate departure times respecting demand patterns
