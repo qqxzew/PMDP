@@ -9,6 +9,7 @@ import 'screens/transfers_screen.dart';
 import 'screens/timetable_screen.dart';
 import 'screens/vehicle_map_screen.dart';
 import 'screens/messages_screen.dart';
+import 'screens/distribution_screen.dart';
 
 void main() {
   runApp(const BlackoutDispatchApp());
@@ -191,8 +192,10 @@ class _AppShellState extends State<AppShell> {
       case 3:
         return 'Jízdní řády';
       case 4:
-        return 'Mapa vozů';
+        return 'Distribuce řidičům';
       case 5:
+        return 'Mapa vozů';
+      case 6:
         return 'Zprávy';
       default:
         return '';
@@ -210,8 +213,10 @@ class _AppShellState extends State<AppShell> {
       case 3:
         return const TimetableScreen();
       case 4:
-        return const VehicleMapScreen();
+        return const DistributionScreen();
       case 5:
+        return const VehicleMapScreen();
+      case 6:
         return const MessagesScreen();
       default:
         return const DashboardScreen();

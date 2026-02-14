@@ -27,10 +27,19 @@ class _TimetableScreenState extends State<TimetableScreen> {
         }
 
         // Get unique lines and vehicles
-        final lines = state.routes
-            .where((r) => r.assignedBuses > 0)
-            .map((r) => r.route.routeShortName)
-            .toList();
+        final lines = state.generatedJobs
+            .map((j) => j.lineNumber)
+            .toSet()
+            .toList()
+          ..sort((a, b) {
+            // Sort: numbers first, then letters (like TT)
+            final aNum = int.tryParse(a.replaceFirst('N', ''));
+            final bNum = int.tryParse(b.replaceFirst('N', ''));
+            if (aNum != null && bNum != null) return aNum.compareTo(bNum);
+            if (aNum != null) return -1;
+            if (bNum != null) return 1;
+            return a.compareTo(b);
+          });
         final vehicles = state.vehicles.map((v) => v.id).toList();
 
         _selectedLine ??= lines.isNotEmpty ? lines.first : null;

@@ -4,9 +4,13 @@ import '../models/gtfs_models.dart';
 import '../models/timetable_models.dart';
 import '../models/transfer_node.dart';
 import '../models/vehicle.dart';
+import '../models/driver_models.dart';
 import '../services/gtfs_parser.dart';
 import '../services/timetable_generator.dart';
 import '../services/transfer_manager.dart';
+import '../services/database_service.dart';
+import '../services/timetable_server.dart';
+import '../services/distribution_manager.dart';
 
 /// Central application state
 class AppState extends ChangeNotifier {
@@ -16,6 +20,7 @@ class AppState extends ChangeNotifier {
   final GtfsParser _parser = GtfsParser();
   final TimetableGenerator _generator = TimetableGenerator();
   final TransferManager _transferManager = TransferManager();
+  final TimetableServer _server = TimetableServer();
 
   // GTFS data
   Map<String, GtfsStop> stops = {};
@@ -40,6 +45,15 @@ class AppState extends ChangeNotifier {
   // Messages
   List<DispatchMessage> messages = [];
   int get unreadCount => messages.where((m) => !m.isRead && m.direction == MessageDirection.incoming).length;
+
+  // Distribution server
+  bool get isServerRunning => _server.isRunning;
+  String? get serverIpAddress => _server.ipAddress;
+  int get serverPort => _server.port;
+
+  // Drivers
+  List<Driver> drivers = [];
+  List<Map<String, dynamic>> driverStatuses = [];
 
   // Statistics
   int get totalTrips => generatedJobs.length;
@@ -68,6 +82,15 @@ class AppState extends ChangeNotifier {
     notifyListeners();
 
     try {
+      // Initialize database (only on desktop platforms)
+      try {
+        await DatabaseService.initialize();
+        await _loadDrivers();
+      } catch (e) {
+        debugPrint('Database initialization skipped (not a desktop platform): $e');
+        // Continue without database on non-desktop platforms
+      }
+
       await _parser.loadAll();
       stops = _parser.stops;
       debugPrint('GTFS loaded: ${_parser.routes.length} routes, ${_parser.trips.length} trips, ${_parser.stopTimes.length} stopTimes, ${stops.length} stops');
@@ -238,12 +261,13 @@ class AppState extends ChangeNotifier {
   }
 
   /// Update transfer node
-  void updateTransfer(String id, {int? maxWaitMinutes, bool? isEnabled}) {
+  void updateTransfer(String id, {int? maxWaitMinutes, bool? isEnabled, TransferPriority? priority}) {
     final index = transferNodes.indexWhere((t) => t.id == id);
     if (index >= 0) {
       transferNodes[index] = transferNodes[index].copyWith(
         maxWaitMinutes: maxWaitMinutes,
         isEnabled: isEnabled,
+        priority: priority,
       );
       _invalidateGeneratedTimetable();
       notifyListeners();
@@ -282,6 +306,9 @@ class AppState extends ChangeNotifier {
         operationDate: operationDate,
       );
 
+      // Add test line TT (internal test line)
+      _addTestLineTT();
+
       isTimetableGenerated = generatedJobs.isNotEmpty;
       _updateVehicles();
       return generatedJobs.length;
@@ -293,6 +320,104 @@ class AppState extends ChangeNotifier {
     } finally {
       isGeneratingTimetable = false;
       notifyListeners();
+    }
+  }
+
+  /// Add internal test line TT with test stops
+  void _addTestLineTT() {
+    // Register test stops if not already present
+    _ensureTestStops();
+
+    // Create test line TT job
+    final testJob = TimetableJob(
+      jobId: 'J-16001',
+      lineNumber: 'TT',
+      vehicleId: 'T-199',
+      stops: [
+        TimetableStop(
+          stopId: 'S001',
+          name: 'Suka',
+          arrivalTime: null,
+          departureTime: DateTime.parse('2026-02-13T19:15:00'),
+          isTerminus: true,
+          transfers: [],
+        ),
+        TimetableStop(
+          stopId: 'S002',
+          name: 'Pizdec',
+          arrivalTime: DateTime.parse('2026-02-13T19:16:00'),
+          departureTime: DateTime.parse('2026-02-13T19:16:00'),
+          isTerminus: false,
+          transfers: [
+            Transfer(
+              jobId: 'T-40055',
+              lineNumber: '4',
+              direction: 'Bory → Doubravka',
+              waitUntil: DateTime.parse('2026-02-13T19:18:00'),
+              isGuaranteed: true,
+              maxWaitMinutes: 2,
+            ),
+          ],
+        ),
+        TimetableStop(
+          stopId: 'S003',
+          name: 'Blyat',
+          arrivalTime: DateTime.parse('2026-02-13T19:17:00'),
+          departureTime: DateTime.parse('2026-02-13T19:17:00'),
+          isTerminus: false,
+          transfers: [],
+        ),
+        TimetableStop(
+          stopId: 'S004',
+          name: 'Ebat',
+          arrivalTime: DateTime.parse('2026-02-13T19:18:00'),
+          departureTime: null,
+          isTerminus: true,
+          transfers: [],
+        ),
+      ],
+    );
+
+    // Add only if not already present (prevent duplicates)
+    if (!generatedJobs.any((j) => j.jobId == 'J-16001')) {
+      generatedJobs.add(testJob);
+      debugPrint('Test line TT added: ${testJob.jobId}');
+    }
+  }
+
+  /// Ensure test stops are registered in the stops map
+  void _ensureTestStops() {
+    final testStops = [
+      GtfsStop(
+        stopId: 'S001',
+        stopName: 'Suka',
+        stopLat: 49.729277,
+        stopLon: 13.408736,
+      ),
+      GtfsStop(
+        stopId: 'S002',
+        stopName: 'Pizdec',
+        stopLat: 49.729353,
+        stopLon: 13.408916,
+      ),
+      GtfsStop(
+        stopId: 'S003',
+        stopName: 'Blyat',
+        stopLat: 49.729290,
+        stopLon: 13.409138,
+      ),
+      GtfsStop(
+        stopId: 'S004',
+        stopName: 'Ebat',
+        stopLat: 49.729313,
+        stopLon: 13.409241,
+      ),
+    ];
+
+    for (final stop in testStops) {
+      if (!stops.containsKey(stop.stopId)) {
+        stops[stop.stopId] = stop;
+      }
     }
   }
 
@@ -402,5 +527,67 @@ class AppState extends ChangeNotifier {
         .map((j) => j.toJson())
         .toList()
         .toString();
+  }
+
+  // ========== DRIVER & DISTRIBUTION MANAGEMENT ==========
+
+  Future<void> _loadDrivers() async {
+    try {
+      drivers = await DatabaseService.getAllDrivers();
+      await _refreshDriverStatuses();
+    } catch (e) {
+      debugPrint('Error loading drivers: $e');
+    }
+  }
+
+  Future<void> _refreshDriverStatuses() async {
+    try {
+      driverStatuses = await DistributionManager.getDriversWithStatus();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Error refreshing driver statuses: $e');
+    }
+  }
+
+  /// Start distribution server
+  Future<bool> startServer({int port = 8080}) async {
+    final started = await _server.start(port: port);
+    notifyListeners();
+    return started;
+  }
+
+  /// Stop distribution server
+  Future<void> stopServer() async {
+    await _server.stop();
+    notifyListeners();
+  }
+
+  /// Assign timetable to driver
+  Future<bool> assignTimetableToDriver(String driverId, String vehicleId) async {
+    if (!isTimetableGenerated) return false;
+    
+    try {
+      final jobs = getVehicleJobs(vehicleId);
+      if (jobs.isEmpty) return false;
+
+      final success = await DistributionManager.assignTimetableToDriver(
+        driverId: driverId,
+        jobs: jobs,
+      );
+
+      if (success) {
+        await _refreshDriverStatuses();
+      }
+
+      return success;
+    } catch (e) {
+      debugPrint('Error assigning timetable: $e');
+      return false;
+    }
+  }
+
+  /// Refresh driver data
+  Future<void> refreshDrivers() async {
+    await _loadDrivers();
   }
 }

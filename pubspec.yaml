@@ -17,6 +17,10 @@ dependencies:
   flutter_map: ^7.0.2
   latlong2: ^0.9.1
   http: ^1.2.2
+  sqflite_common_ffi: ^2.3.0
+  path: ^1.9.0
+  shelf: ^1.4.1
+  shelf_router: ^1.1.4
 
 dev_dependencies:
   flutter_test:
