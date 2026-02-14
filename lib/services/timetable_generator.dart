@@ -1,15 +1,20 @@
 import 'dart:math' as math;
 
 import 'package:uuid/uuid.dart';
+import 'package:latlong2/latlong.dart';
 import '../models/gtfs_models.dart';
 import '../models/timetable_models.dart';
 import '../models/transfer_node.dart';
+import 'osrm_routing_service.dart';
 
 /// Service for generating emergency timetables
 class TimetableGenerator {
   static const _uuid = Uuid();
-  static const int _meetingBufferMinutes = 2;
   static const double _rerouteSpeedKmh = 20.0;
+
+  final OsrmRoutingService? routingService;
+
+  TimetableGenerator({this.routingService});
 
   /// Daily demand multipliers for each hour (0-23)
   /// Represents relative frequency: 1.0 = base interval, 0.5 = double frequency
@@ -41,19 +46,19 @@ class TimetableGenerator {
   };
 
   /// Czech driver labor regulations
-  static const int maxDrivingHours = 9; // Max 9 hours driving per day
+  static const int maxDrivingHours = 8; // Max 8 hours driving per shift
   static const int mandatoryBreakMinutes = 45; // After 4.5 hours
   static const int maxDrivingBeforeBreak = 270; // 4.5 hours in minutes
   static const int minDailyRestHours = 11; // Min daily rest
-  static const int maxShiftHours = 13; // Max shift length
+  static const int maxShiftHours = 8; // Max shift length (EU regulations)
 
   /// Generate all timetable jobs for all routes
-  List<TimetableJob> generateTimetable({
+  Future<List<TimetableJob>> generateTimetable({
     required List<RouteData> routes,
     required Map<String, GtfsStop> stops,
     required List<TransferNode> transferNodes,
     required DateTime operationDate,
-  }) {
+  }) async {
     final allJobs = <TimetableJob>[];
 
     for (final route in routes) {
@@ -69,7 +74,7 @@ class TimetableGenerator {
     final enabledTransfers = transferNodes.where((t) => t.isEnabled).toList();
 
     // Crisis optimization: rerouting + synchronized meetings with wait buffer.
-    _optimizeTransferMeetings(
+    await _optimizeTransferMeetings(
       allJobs: allJobs,
       transferNodes: enabledTransfers,
       stops: stops,
@@ -77,6 +82,9 @@ class TimetableGenerator {
 
     // Apply transfer information
     _applyTransfers(allJobs, enabledTransfers, stops);
+
+    // Assign drivers with 8-hour shifts
+    _assignDriverShifts(allJobs);
 
     return allJobs;
   }
@@ -306,6 +314,7 @@ class TimetableGenerator {
                 waitUntil: waitUntil,
                 isGuaranteed: waitDuration.inMinutes <= transfer.maxWaitMinutes,
                 maxWaitMinutes: transfer.maxWaitMinutes,
+                status: waitDuration.inMinutes > 0 ? 'Wait' : 'Sync',
               ));
             }
           }
@@ -314,31 +323,32 @@ class TimetableGenerator {
     }
   }
 
-  void _optimizeTransferMeetings({
+  Future<void> _optimizeTransferMeetings({
     required List<TimetableJob> allJobs,
     required List<TransferNode> transferNodes,
     required Map<String, GtfsStop> stops,
-  }) {
+  }) async {
     for (final transfer in transferNodes) {
       if (!transfer.isSameStop) {
-        _applyReroutingForTransfer(allJobs, transfer, stops);
+        await _applyReroutingForTransfer(allJobs, transfer, stops);
       }
       _synchronizeTransferPair(allJobs, transfer);
     }
   }
 
-  void _applyReroutingForTransfer(
+  Future<void> _applyReroutingForTransfer(
     List<TimetableJob> allJobs,
     TransferNode transfer,
     Map<String, GtfsStop> stops,
-  ) {
+  ) async {
+    // Insert partner stop into Line 1 path
     for (int i = 0; i < allJobs.length; i++) {
       final job = allJobs[i];
       if (job.lineNumber != transfer.lineNumber1) continue;
       if (!job.stops.any((s) => s.stopId == transfer.stopId1)) continue;
       if (job.stops.any((s) => s.stopId == transfer.stopId2)) continue;
 
-      final rerouted = _insertRerouteStop(
+      final rerouted = await _insertRerouteStop(
         job: job,
         afterStopId: transfer.stopId1,
         insertedStopId: transfer.stopId2,
@@ -346,14 +356,30 @@ class TimetableGenerator {
       );
       allJobs[i] = rerouted;
     }
+
+    // Insert partner stop into Line 2 path
+    for (int i = 0; i < allJobs.length; i++) {
+      final job = allJobs[i];
+      if (job.lineNumber != transfer.lineNumber2) continue;
+      if (!job.stops.any((s) => s.stopId == transfer.stopId2)) continue;
+      if (job.stops.any((s) => s.stopId == transfer.stopId1)) continue;
+
+      final rerouted = await _insertRerouteStop(
+        job: job,
+        afterStopId: transfer.stopId2,
+        insertedStopId: transfer.stopId1,
+        stops: stops,
+      );
+      allJobs[i] = rerouted;
+    }
   }
 
-  TimetableJob _insertRerouteStop({
+  Future<TimetableJob> _insertRerouteStop({
     required TimetableJob job,
     required String afterStopId,
     required String insertedStopId,
     required Map<String, GtfsStop> stops,
-  }) {
+  }) async {
     final afterIndex = job.stops.indexWhere((s) => s.stopId == afterStopId);
     if (afterIndex < 0) return job;
 
@@ -365,12 +391,31 @@ class TimetableGenerator {
     final baseDeparture = afterStop.departureTime ?? afterStop.arrivalTime;
     if (baseDeparture == null) return job;
 
-    final distanceMeters = _distanceMeters(
-      from.stopLat,
-      from.stopLon,
-      inserted.stopLat,
-      inserted.stopLon,
-    );
+    double distanceMeters;
+    if (routingService != null) {
+      final poly = await routingService!.getSegmentPolyline(
+        fromStopId: from.stopId,
+        from: LatLng(from.stopLat, from.stopLon),
+        toStopId: inserted.stopId,
+        to: LatLng(inserted.stopLat, inserted.stopLon),
+      );
+      distanceMeters = routingService!.polylineLengthMeters(poly);
+      if (distanceMeters <= 0) {
+        distanceMeters = _distanceMeters(
+          from.stopLat,
+          from.stopLon,
+          inserted.stopLat,
+          inserted.stopLon,
+        );
+      }
+    } else {
+      distanceMeters = _distanceMeters(
+        from.stopLat,
+        from.stopLon,
+        inserted.stopLat,
+        inserted.stopLon,
+      );
+    }
     final travelMinutes = math.max(1, (distanceMeters / 1000 / _rerouteSpeedKmh * 60).round());
     final insertedArrival = baseDeparture.add(Duration(minutes: travelMinutes));
 
@@ -422,56 +467,49 @@ class TimetableGenerator {
     List<TimetableJob> allJobs,
     TransferNode transfer,
   ) {
-    final line1Jobs = allJobs
+    final sourceLineJobs = allJobs
         .where((j) => j.lineNumber == transfer.lineNumber1)
         .where((j) => j.stops.any((s) => s.stopId == transfer.stopId1))
         .toList();
-    final line2Jobs = allJobs
+    final targetLineJobs = allJobs
         .where((j) => j.lineNumber == transfer.lineNumber2)
         .where((j) => j.stops.any((s) => s.stopId == transfer.stopId2))
         .toList();
 
-    for (final job1 in line1Jobs) {
-      final stop1 = job1.stops.firstWhere((s) => s.stopId == transfer.stopId1);
-      final arrival1 = stop1.arrivalTime;
-      if (arrival1 == null) continue;
+    // Directional sync:
+    // Departure(B) = Arrival(A) + gapMinutes
+    for (final sourceJob in sourceLineJobs) {
+      final sourceStop =
+          sourceJob.stops.firstWhere((s) => s.stopId == transfer.stopId1);
+      final arrivalA = sourceStop.arrivalTime;
+      if (arrivalA == null) continue;
 
-      TimetableJob? partner;
+      TimetableJob? partnerB;
       int bestMinutes = 1 << 30;
-      for (final job2 in line2Jobs) {
-        if (job2.jobId == job1.jobId) continue;
-        final stop2 = job2.stops.firstWhere((s) => s.stopId == transfer.stopId2);
-        final arrival2 = stop2.arrivalTime;
-        if (arrival2 == null) continue;
-        final diff = (arrival1.difference(arrival2).inMinutes).abs();
+      for (final targetJob in targetLineJobs) {
+        if (targetJob.jobId == sourceJob.jobId) continue;
+        final targetStop =
+            targetJob.stops.firstWhere((s) => s.stopId == transfer.stopId2);
+        final departureB = targetStop.departureTime ?? targetStop.arrivalTime;
+        if (departureB == null) continue;
+        final diff = (arrivalA.difference(departureB).inMinutes).abs();
         if (diff < bestMinutes) {
           bestMinutes = diff;
-          partner = job2;
+          partnerB = targetJob;
         }
       }
-      if (partner == null) continue;
+      if (partnerB == null) continue;
 
-      final partnerStop =
-          partner.stops.firstWhere((s) => s.stopId == transfer.stopId2);
-      final arrival2 = partnerStop.arrivalTime;
-      if (arrival2 == null) continue;
+        final desiredDepartureB =
+          arrivalA.add(Duration(minutes: transfer.maxWaitMinutes));
 
-      final tMeet = (arrival1.isAfter(arrival2) ? arrival1 : arrival2)
-          .add(const Duration(minutes: _meetingBufferMinutes));
-
-      final updatedJob1 = _delayFromTransferStop(
-        job: job1,
-        transferStopId: transfer.stopId1,
-        meetTime: tMeet,
-      );
-      final updatedJob2 = _delayFromTransferStop(
-        job: partner,
+      final updatedTargetJob = _delayFromTransferStop(
+        job: partnerB,
         transferStopId: transfer.stopId2,
-        meetTime: tMeet,
+        meetTime: desiredDepartureB,
       );
 
-      _replaceJob(allJobs, updatedJob1);
-      _replaceJob(allJobs, updatedJob2);
+      _replaceJob(allJobs, updatedTargetJob);
     }
   }
 
@@ -552,6 +590,163 @@ class TimetableGenerator {
   }
 
   double _degToRad(double deg) => deg * math.pi / 180.0;
+
+  /// Assign drivers to jobs based on 8-hour shifts
+  void _assignDriverShifts(List<TimetableJob> jobs) {
+    // Group jobs by vehicle
+    final vehicleJobs = <String, List<TimetableJob>>{};
+    for (final job in jobs) {
+      final vid = job.vehicleId ?? 'unassigned';
+      vehicleJobs.putIfAbsent(vid, () => []);
+      vehicleJobs[vid]!.add(job);
+    }
+
+    const maxShiftMinutes = 8 * 60;
+    const handoverMinutes = 20;
+
+    // Process each vehicle's schedule
+    for (final entry in vehicleJobs.entries) {
+      final vehicleId = entry.key;
+      final jobsList = entry.value;
+
+      // Sort by start time
+      jobsList.sort((a, b) {
+        final aTime = a.startTime ?? DateTime(2099);
+        final bTime = b.startTime ?? DateTime(2099);
+        return aTime.compareTo(bTime);
+      });
+
+      final firstStart = jobsList.first.startTime;
+      final lastEnd = jobsList.last.endTime;
+      if (firstStart == null || lastEnd == null) continue;
+
+      final totalWindowMinutes =
+          math.max(1, lastEnd.difference(firstStart).inMinutes);
+      final shiftCount = math.max(1, (totalWindowMinutes / maxShiftMinutes).ceil());
+      final segmentMinutes = (totalWindowMinutes / shiftCount).ceil();
+
+      // Driver boundaries split whole daily window into 2-3+ equal segments.
+      final boundaries = <DateTime>[];
+      for (int i = 1; i < shiftCount; i++) {
+        boundaries.add(firstStart.add(Duration(minutes: segmentMinutes * i)));
+      }
+
+      int driverNumber = 1;
+      int boundaryIdx = 0;
+      DateTime? currentDriverWindowStart = firstStart;
+
+      for (int i = 0; i < jobsList.length; i++) {
+        var job = jobsList[i];
+        var jobStart = job.startTime;
+        if (jobStart == null) continue;
+
+        while (boundaryIdx < boundaries.length) {
+          final currentStart = jobStart;
+          if (currentStart == null || currentStart.isBefore(boundaries[boundaryIdx])) {
+            break;
+          }
+          final previousEnd = i > 0 ? jobsList[i - 1].endTime : null;
+
+          if (previousEnd != null) {
+            final handoverTarget = previousEnd.add(const Duration(minutes: handoverMinutes));
+            if (currentStart.isBefore(handoverTarget)) {
+              final delta = handoverTarget.difference(currentStart);
+              _delayJobsFromIndex(jobsList, i, delta, jobs);
+              job = jobsList[i];
+              jobStart = job.startTime;
+              if (jobStart == null) break;
+            }
+            currentDriverWindowStart = handoverTarget;
+          } else {
+            currentDriverWindowStart = jobStart;
+          }
+
+          driverNumber++;
+          boundaryIdx++;
+        }
+
+        if (jobStart == null) continue;
+        final currentStart = jobStart;
+
+        if (currentDriverWindowStart != null) {
+          final workedMinutes = currentStart.difference(currentDriverWindowStart).inMinutes;
+          if (workedMinutes >= maxShiftMinutes) {
+            final previousEnd = i > 0 ? jobsList[i - 1].endTime : null;
+            if (previousEnd != null) {
+              final handoverTarget = previousEnd.add(const Duration(minutes: handoverMinutes));
+              if (currentStart.isBefore(handoverTarget)) {
+                final delta = handoverTarget.difference(currentStart);
+                _delayJobsFromIndex(jobsList, i, delta, jobs);
+                job = jobsList[i];
+                jobStart = job.startTime;
+              }
+              currentDriverWindowStart = handoverTarget;
+            } else {
+              currentDriverWindowStart = jobStart;
+            }
+            driverNumber++;
+          }
+        }
+
+        // Assign driver ID
+        final driverId = 'D-$vehicleId-$driverNumber';
+
+        // Create new job with driverId (jobs are immutable, so we need to replace)
+        final updatedJob = TimetableJob(
+          jobId: job.jobId,
+          lineNumber: job.lineNumber,
+          vehicleId: job.vehicleId,
+          driverId: driverId,
+          stops: job.stops,
+        );
+
+        // Replace in the original list
+        final originalIndex = jobs.indexWhere((j) => j.jobId == job.jobId);
+        if (originalIndex >= 0) {
+          jobs[originalIndex] = updatedJob;
+        }
+      }
+    }
+  }
+
+  void _delayJobsFromIndex(
+    List<TimetableJob> vehicleJobs,
+    int startIndex,
+    Duration delta,
+    List<TimetableJob> allJobs,
+  ) {
+    if (delta.inMinutes <= 0) return;
+
+    for (int i = startIndex; i < vehicleJobs.length; i++) {
+      final oldJob = vehicleJobs[i];
+      final shiftedStops = oldJob.stops
+          .map(
+            (s) => TimetableStop(
+              stopId: s.stopId,
+              name: s.name,
+              arrivalTime: s.arrivalTime?.add(delta),
+              departureTime: s.departureTime?.add(delta),
+              isTerminus: s.isTerminus,
+              transfers: List<Transfer>.from(s.transfers),
+            ),
+          )
+          .toList(growable: false);
+
+      final shiftedJob = TimetableJob(
+        jobId: oldJob.jobId,
+        lineNumber: oldJob.lineNumber,
+        vehicleId: oldJob.vehicleId,
+        driverId: oldJob.driverId,
+        stops: shiftedStops,
+      );
+
+      vehicleJobs[i] = shiftedJob;
+      final idx = allJobs.indexWhere((j) => j.jobId == shiftedJob.jobId);
+      if (idx >= 0) {
+        allJobs[idx] = shiftedJob;
+      }
+    }
+  }
 
   /// Get shift assignments respecting driver regulations
   Map<String, List<TimetableJob>> getVehicleShifts(List<TimetableJob> jobs) {

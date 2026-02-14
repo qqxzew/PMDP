@@ -1,12 +1,14 @@
-﻿import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:provider/provider.dart';
+
+import '../models/gtfs_models.dart';
+import '../models/transfer_node.dart';
 import '../providers/app_state.dart';
 import '../theme/app_theme.dart';
-import '../models/transfer_node.dart';
-import '../models/gtfs_models.dart';
-import '../services/osrm_service.dart';
 
 class TransfersScreen extends StatefulWidget {
   const TransfersScreen({super.key});
@@ -16,12 +18,6 @@ class TransfersScreen extends StatefulWidget {
 }
 
 class _TransfersScreenState extends State<TransfersScreen> {
-  String? _selectedLineA;
-  String? _selectedStopA;
-  String? _selectedLineB;
-  String? _selectedStopB;
-  String? _highlightedLine;
-
   static const _routeColors = [
     Color(0xFFE53E3E),
     Color(0xFF3182CE),
@@ -37,15 +33,73 @@ class _TransfersScreenState extends State<TransfersScreen> {
     Color(0xFF9C4221),
   ];
 
+  final Map<String, List<LatLng>> _routeGeometry = {};
+  final Set<String> _activeLineNumbers = {};
+
+  // Selection state for creating transfers
+  String? _selectedLine1;
+  String? _selectedLine2;
+  String? _selectedStopId;
+  int _syncGapMinutes = 5;
+
+  _MapPick? _pickA;
+  _MapPick? _pickB;
+
+  bool _showLayers = false;
+  bool _showTransferNodes = true;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final state = context.read<AppState>();
+    if (_activeLineNumbers.isEmpty) {
+      _activeLineNumbers.addAll(state.routes.map((r) => r.route.routeShortName));
+    }
+  }
+
+  Future<void> _warmupRouteGeometry(
+    AppState state, {
+    Set<String>? onlyLines,
+  }) async {
+    final routing = state.osrmRoutingService;
+    for (final route in state.routes) {
+      final line = route.route.routeShortName;
+      if (onlyLines != null && !onlyLines.contains(line)) continue;
+      final fwd = _stopTimesToPoints(route.forwardStopTimes, state.stops);
+      final bwd = _stopTimesToPoints(route.backwardStopTimes, state.stops);
+      if (fwd.length >= 2) {
+        final key = 'line:$line:0';        final poly = await routing.getRoutePolyline(
+          cacheKey: key,
+          waypoints: fwd,
+        );
+        if (mounted) setState(() => _routeGeometry[key] = poly);
+      }
+      if (bwd.length >= 2) {
+        final key = 'line:$line:1';
+        final poly = await routing.getRoutePolyline(
+          cacheKey: key,
+          waypoints: bwd,
+        );
+        if (mounted) setState(() => _routeGeometry[key] = poly);
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Consumer<AppState>(
       builder: (context, state, _) {
         return Row(
           children: [
-            SizedBox(width: 440, child: _buildLeftPanel(state)),
+            Flexible(
+              flex: 35,
+              child: _buildLeftPanel(state),
+            ),
             Container(width: 1, color: AppTheme.border),
-            Expanded(child: _buildMapPanel(state)),
+            Flexible(
+              flex: 65,
+              child: _buildMapPanel(state),
+            ),
           ],
         );
       },
@@ -53,136 +107,576 @@ class _TransfersScreenState extends State<TransfersScreen> {
   }
 
   Widget _buildLeftPanel(AppState state) {
-    final autoTransfers = state.transferNodes.where((t) => t.isAutomatic).toList();
-    final manualTransfers = state.transferNodes.where((t) => !t.isAutomatic).toList();
-
+    final transfers = state.transferNodes;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        // Header
         Container(
           padding: const EdgeInsets.all(16),
+          decoration: const BoxDecoration(
+            color: AppTheme.surfaceWhite,
+            border: Border(bottom: BorderSide(color: AppTheme.border)),
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('Přestupní uzly',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: AppTheme.textPrimary)),
+              const Text(
+                'Přestupní uzly',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: AppTheme.textPrimary,
+                ),
+              ),
               const SizedBox(height: 4),
-              Text(
-                '${state.transferNodes.length} vazeb celkem, ${state.transferNodes.where((t) => t.isEnabled).length} aktivních',
-                style: const TextStyle(fontSize: 13, color: AppTheme.textSecondary),
+              const Text(
+                'Synchronizace spojů mezi linkami',
+                style: TextStyle(fontSize: 12, color: AppTheme.textMuted),
               ),
             ],
           ),
         ),
-        const Divider(height: 1),
-        _buildSyncPanel(state),
-        const Divider(height: 1),
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        
+        // Line selection section
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: const BoxDecoration(
+            color: AppTheme.surfaceWhite,
+            border: Border(bottom: BorderSide(color: AppTheme.border)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (manualTransfers.isNotEmpty) ...[
-                _sectionLabel('Vlastní (${manualTransfers.length})'),
-                ...manualTransfers.map((t) => _TransferRow(transfer: t)),
-                const SizedBox(height: 12),
-              ],
-              _sectionLabel('Automatické (${autoTransfers.length})'),
-              ...autoTransfers.map((t) => _TransferRow(transfer: t)),
-              if (autoTransfers.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.all(12),
-                  child: Text('Žádné automatické přestupy.', style: TextStyle(fontSize: 12, color: AppTheme.textMuted)),
+              const Text(
+                '1. Vyberte dvě linky',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: AppTheme.textPrimary,
                 ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildLineDropdown('Linka A', _selectedLine1, (value) {
+                      setState(() {
+                        _selectedLine1 = value;
+                        _selectedStopId = null; // Reset stop selection
+                      });
+                    }, state),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _buildLineDropdown('Linka B', _selectedLine2, (value) {
+                      setState(() {
+                        _selectedLine2 = value;
+                        _selectedStopId = null; // Reset stop selection
+                      });
+                    }, state),
+                  ),
+                ],
+              ),
+              
+              // Stop selection
+              if (_selectedLine1 != null && _selectedLine2 != null) ...[
+                const SizedBox(height: 16),
+                const Text(
+                  '2. Vyberte zastávku',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: AppTheme.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                _buildStopDropdown(state),
+                
+                const SizedBox(height: 16),
+                const Text(
+                  '3. Nastavte čas',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: AppTheme.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    const Text('Gap (minuty):', style: TextStyle(fontSize: 12)),
+                    const SizedBox(width: 8),
+                    SizedBox(
+                      width: 60,
+                      child: TextFormField(
+                        initialValue: _syncGapMinutes.toString(),
+                        keyboardType: TextInputType.number,
+                        textAlign: TextAlign.center,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                          border: OutlineInputBorder(),
+                        ),
+                        onChanged: (v) {
+                          final parsed = int.tryParse(v);
+                          if (parsed != null) {
+                            setState(() => _syncGapMinutes = parsed.clamp(1, 30));
+                          }
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+                
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: _selectedStopId != null
+                        ? () => _synchronizeTransfer(state)
+                        : null,
+                    icon: const Icon(Icons.sync),
+                    label: const Text('Synchronizovat'),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
+        ),
+        
+        // Existing transfers list
+        Container(
+          padding: const EdgeInsets.all(16),
+          child: const Text(
+            'Aktivní synchronizace',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: AppTheme.textPrimary,
+            ),
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: transfers.isEmpty
+              ? const Center(
+                  child: Text(
+                    'Žádné synchronizace',
+                    style: TextStyle(fontSize: 13, color: AppTheme.textMuted),
+                  ),
+                )
+              : ListView.separated(
+                  padding: const EdgeInsets.all(10),
+                  itemCount: transfers.length,
+                  separatorBuilder: (context, index) => const SizedBox(height: 8),
+                  itemBuilder: (context, index) {
+                    final transfer = transfers[index];
+                    return _TransferTableRow(transfer: transfer);
+                  },
+                ),
         ),
       ],
     );
   }
 
-  Widget _sectionLabel(String text) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6, top: 4),
-      child: Text(text,
-          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.textMuted, letterSpacing: 0.5)),
+  Widget _buildLineDropdown(String label, String? value, Function(String?) onChanged, AppState state) {
+    return DropdownButtonFormField<String>(
+      decoration: InputDecoration(
+        labelText: label,
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        border: const OutlineInputBorder(),
+      ),
+      initialValue: value,
+      items: state.routes.map((route) {
+        return DropdownMenuItem(
+          value: route.route.routeShortName,
+          child: Text(route.route.routeShortName),
+        );
+      }).toList(),
+      onChanged: onChanged,
     );
   }
 
-  Widget _buildSyncPanel(AppState state) {
-    final lineOptions = state.routes.map((r) => r.route.routeShortName).toList();
+  Widget _buildStopDropdown(AppState state) {
+    final route1 = state.routes.firstWhere((r) => r.route.routeShortName == _selectedLine1);
+    final route2 = state.routes.firstWhere((r) => r.route.routeShortName == _selectedLine2);
+    
+    // Получаем конечные остановки для определения направления
+    final route1FwdDest = route1.forwardStopTimes.isNotEmpty 
+        ? state.stops[route1.forwardStopTimes.last.stopId]?.stopName ?? '?'
+        : '?';
+    final route1BwdDest = route1.backwardStopTimes.isNotEmpty
+        ? state.stops[route1.backwardStopTimes.last.stopId]?.stopName ?? '?'
+        : '?';
+    final route2FwdDest = route2.forwardStopTimes.isNotEmpty
+        ? state.stops[route2.forwardStopTimes.last.stopId]?.stopName ?? '?'
+        : '?';
+    final route2BwdDest = route2.backwardStopTimes.isNotEmpty
+        ? state.stops[route2.backwardStopTimes.last.stopId]?.stopName ?? '?'
+        : '?';
+    
+    final stops1Fwd = route1.forwardStopTimes.map((st) => st.stopId).toSet();
+    final stops1Bwd = route1.backwardStopTimes.map((st) => st.stopId).toSet();
+    final stops2Fwd = route2.forwardStopTimes.map((st) => st.stopId).toSet();
+    final stops2Bwd = route2.backwardStopTimes.map((st) => st.stopId).toSet();
+    
+    // Находим близкие остановки между двумя маршрутами (без дубликатов)
+    final nearbyStops = <String, Map<String, dynamic>>{};
+    final processedStops = <String>{};
+    
+    // Проверяем все комбинации направлений
+    for (final stopId1 in [...stops1Fwd, ...stops1Bwd]) {
+      final stop1 = state.stops[stopId1];
+      if (stop1 == null || processedStops.contains(stop1.stopName)) continue;
+      
+      for (final stopId2 in [...stops2Fwd, ...stops2Bwd]) {
+        final stop2 = state.stops[stopId2];
+        if (stop2 == null) continue;
+        
+        final distance = _calculateDistance(
+          stop1.stopLat, stop1.stopLon,
+          stop2.stopLat, stop2.stopLon,
+        );
+        
+        if (distance < 200) {
+          if (processedStops.contains(stop1.stopName)) continue;
+          
+          // Определяем направления для обеих линий
+          final line1Dir = stops1Fwd.contains(stopId1) ? '→ $route1FwdDest' : '→ $route1BwdDest';
+          final line2Dir = stops2Fwd.contains(stopId2) ? '→ $route2FwdDest' : '→ $route2BwdDest';
+          
+          final key = stopId1 == stopId2 ? stopId1 : '$stopId1-$stopId2';
+          nearbyStops[key] = {
+            'stopId1': stopId1,
+            'stopId2': stopId2,
+            'name': stop1.stopName,
+            'distance': distance,
+            'line1Direction': line1Dir,
+            'line2Direction': line2Dir,
+          };
+          processedStops.add(stop1.stopName);
+          break;
+        }
+      }
+    }
+    
+    if (nearbyStops.isEmpty) {
+      return const Text(
+        'Žádné blízké zastávky mezi těmito linkami',
+        style: TextStyle(fontSize: 12, color: AppTheme.warning),
+      );
+    }
+    
+    return DropdownButtonFormField<String>(
+      decoration: const InputDecoration(
+        labelText: 'Zastávka',
+        isDense: true,
+        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        border: OutlineInputBorder(),
+      ),
+      isExpanded: true,
+      initialValue: _selectedStopId,
+      items: nearbyStops.entries.map((entry) {
+        final data = entry.value;
+        final distance = (data['distance'] as double).round();
+        return DropdownMenuItem(
+          value: entry.key,
+          child: Text(
+            '${data['name']} (${distance}m)',
+            style: const TextStyle(fontSize: 12),
+            overflow: TextOverflow.ellipsis,
+          ),
+        );
+      }).toList(),
+      onChanged: (value) {
+        setState(() => _selectedStopId = value);
+      },
+    );
+  }
 
-    List<MapEntry<String, String>> stopsForLine(String? lineNumber) {
-      if (lineNumber == null) return [];
-      final route = state.routes.where((r) => r.route.routeShortName == lineNumber).firstOrNull;
-      if (route == null) return [];
-      return route.allStopIds.map((id) => MapEntry(id, state.stops[id]?.stopName ?? id)).toList()
-        ..sort((a, b) => a.value.compareTo(b.value));
+  double _calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+    const earthRadius = 6371000.0; // meters
+    final dLat = _degToRad(lat2 - lat1);
+    final dLon = _degToRad(lon2 - lon1);
+    
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(_degToRad(lat1)) * math.cos(_degToRad(lat2)) *
+        math.sin(dLon / 2) * math.sin(dLon / 2);
+    final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+    return earthRadius * c;
+  }
+
+  double _degToRad(double deg) => deg * math.pi / 180.0;
+
+  void _synchronizeTransfer(AppState state) {
+    if (_selectedLine1 == null || _selectedLine2 == null || _selectedStopId == null) return;
+    
+    final stopParts = _selectedStopId!.split('-');
+    final stopId1 = stopParts[0];
+    final stopId2 = stopParts.length > 1 ? stopParts[1] : stopParts[0];
+    
+    final stop1 = state.stops[stopId1];
+    final stop2 = state.stops[stopId2];
+    
+    if (stop1 == null || stop2 == null) return;
+    
+    // Добавляем transfer node
+    state.addManualTransfer(
+      stopId1: stopId1,
+      stopName1: stop1.stopName,
+      lineNumber1: _selectedLine1!,
+      stopId2: stopId2,
+      stopName2: stop2.stopName,
+      lineNumber2: _selectedLine2!,
+      maxWaitMinutes: _syncGapMinutes,
+    );
+    
+    // Инвалидируем кэш геометрии маршрутов для перезагрузки
+    _routeGeometry.clear();
+    
+    // Сохраняем значения перед сбросом для использования в Future
+    final line1 = _selectedLine1;
+    final line2 = _selectedLine2;
+    
+    // Reset selection
+    setState(() {
+      _selectedLine1 = null;
+      _selectedLine2 = null;
+      _selectedStopId = null;
+    });
+    
+    // Перезагружаем геометрию только для измененных линий
+    if (line1 != null && line2 != null) {
+      Future.delayed(const Duration(milliseconds: 500), () {
+        _warmupRouteGeometry(
+          state,
+          onlyLines: {line1, line2},
+        );
+      });
+    }
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Synchronizace vytvořena - maršruty se aktualizují'),
+        duration: Duration(seconds: 3),
+      ),
+    );
+  }
+
+  Widget _buildMapPanel(AppState state) {
+    const center = LatLng(49.7475, 13.3776);
+    final visibleRoutes = state.routes
+        .where((r) => _activeLineNumbers.contains(r.route.routeShortName))
+        .toList();
+
+    final polylines = <Polyline>[];
+    for (int i = 0; i < state.routes.length; i++) {
+      final route = state.routes[i];
+      final line = route.route.routeShortName;
+      if (!_activeLineNumbers.contains(line)) continue;
+      final color = _routeColors[i % _routeColors.length];
+
+      final fwdKey = 'line:$line:0';
+      final bwdKey = 'line:$line:1';
+
+      final fwd = _routeGeometry[fwdKey] ?? _stopTimesToPoints(route.forwardStopTimes, state.stops);
+      final bwd = _routeGeometry[bwdKey] ?? _stopTimesToPoints(route.backwardStopTimes, state.stops);
+
+      if (fwd.length >= 2) {
+        polylines.add(Polyline(points: fwd, color: color, strokeWidth: 4));
+      }
+      if (bwd.length >= 2) {
+        polylines.add(Polyline(
+          points: bwd,
+          color: color.withValues(alpha: 0.65),
+          strokeWidth: 3,
+          pattern: const StrokePattern.dotted(),
+        ));
+      }
     }
 
-    final stopsA = stopsForLine(_selectedLineA);
-    final stopsB = stopsForLine(_selectedLineB);
-    final canSync = _selectedLineA != null && _selectedLineB != null && _selectedStopA != null && _selectedStopB != null;
+    final stopMarkers = <Marker>[];
+    for (final route in visibleRoutes) {
+      for (final stopId in route.allStopIds) {
+        final stop = state.stops[stopId];
+        if (stop == null || stop.stopLat == 0 || stop.stopLon == 0) continue;
+        final pickType = _pickTypeForStop(stopId);
+        stopMarkers.add(
+          Marker(
+            point: LatLng(stop.stopLat, stop.stopLon),
+            width: 18,
+            height: 18,
+            child: GestureDetector(
+              onTap: () => _handleStopTap(route.route.routeShortName, stopId, stop.stopName, state),
+              child: Container(
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: pickType == _PickType.none ? Colors.white : AppTheme.primary,
+                  border: Border.all(
+                    color: pickType == _PickType.none ? const Color(0xFF4A5568) : AppTheme.primary,
+                    width: 2,
+                  ),
+                ),
+                child: pickType == _PickType.none
+                    ? null
+                    : Center(
+                        child: Text(
+                          pickType == _PickType.a ? 'A' : 'B',
+                          style: const TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+              ),
+            ),
+          ),
+        );
+      }
+    }
 
+    final nodePolylines = <Polyline>[];
+    final nodeMarkers = <Marker>[];
+    if (_showTransferNodes) {
+      for (final node in state.transferNodes.where((t) => t.isEnabled)) {
+        final s1 = state.stops[node.stopId1];
+        final s2 = state.stops[node.stopId2];
+        if (s1 == null || s2 == null) continue;
+        if (s1.stopLat == 0 || s1.stopLon == 0 || s2.stopLat == 0 || s2.stopLon == 0) continue;
+        final p1 = LatLng(s1.stopLat, s1.stopLon);
+        final p2 = LatLng(s2.stopLat, s2.stopLon);
+
+        if (node.stopId1 != node.stopId2) {
+          nodePolylines.add(
+            Polyline(
+              points: [p1, p2],
+              color: const Color(0xFF2D3748),
+              strokeWidth: 2,
+              pattern: StrokePattern.dashed(segments: [8, 5]),
+            ),
+          );
+        }
+        nodeMarkers.add(
+          Marker(
+            point: p1,
+            width: 16,
+            height: 16,
+            child: Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: Colors.white,
+                border: Border.all(color: const Color(0xFF2D3748), width: 2),
+              ),
+            ),
+          ),
+        );
+      }
+    }
+
+    return Stack(
+      children: [
+        FlutterMap(
+          options: const MapOptions(
+            initialCenter: center,
+            initialZoom: 13,
+            minZoom: 10,
+            maxZoom: 18,
+          ),
+          children: [
+            TileLayer(
+              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+              userAgentPackageName: 'cz.blackout.dispatch',
+            ),
+            PolylineLayer(polylines: polylines),
+            PolylineLayer(polylines: nodePolylines),
+            MarkerLayer(markers: stopMarkers),
+            MarkerLayer(markers: nodeMarkers),
+          ],
+        ),
+        Positioned(
+          top: 12,
+          right: 12,
+          child: FloatingActionButton.small(
+            heroTag: 'layersPanel',
+            backgroundColor: Colors.white,
+            onPressed: () => setState(() => _showLayers = !_showLayers),
+            child: const Icon(Icons.layers_outlined, color: AppTheme.textPrimary),
+          ),
+        ),
+        if (_showLayers)
+          Positioned(
+            top: 60,
+            right: 12,
+            width: 230,
+            bottom: 24,
+            child: _buildLayersPanel(state),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildLayersPanel(AppState state) {
     return Container(
-      padding: const EdgeInsets.all(12),
-      color: AppTheme.surface,
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.98),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: AppTheme.border),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.08),
+            blurRadius: 8,
+          ),
+        ],
+      ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('Nová synchronizace',
-              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: AppTheme.textPrimary)),
-          const SizedBox(height: 8),
-          Row(children: [
-            const SizedBox(width: 56, child: Text('Linka A', style: TextStyle(fontSize: 12, color: AppTheme.textMuted))),
-            Expanded(
-              child: _MiniDropdown<String>(
-                value: _selectedLineA,
-                hint: 'Vyberte',
-                items: lineOptions.map((l) => DropdownMenuItem(value: l, child: Text(l))).toList(),
-                onChanged: (v) => setState(() { _selectedLineA = v; _selectedStopA = null; _highlightedLine = v; }),
+          const Padding(
+            padding: EdgeInsets.all(12),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Слои',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700),
               ),
             ),
-            const SizedBox(width: 6),
-            Expanded(
-              flex: 2,
-              child: _MiniDropdown<String>(
-                value: _selectedStopA,
-                hint: 'Zastávka',
-                items: stopsA.map((s) => DropdownMenuItem(value: s.key, child: Text(s.value))).toList(),
-                onChanged: (v) => setState(() => _selectedStopA = v),
-              ),
-            ),
-          ]),
-          const SizedBox(height: 6),
-          Row(children: [
-            const SizedBox(width: 56, child: Text('Linka B', style: TextStyle(fontSize: 12, color: AppTheme.textMuted))),
-            Expanded(
-              child: _MiniDropdown<String>(
-                value: _selectedLineB,
-                hint: 'Vyberte',
-                items: lineOptions.where((l) => l != _selectedLineA).map((l) => DropdownMenuItem(value: l, child: Text(l))).toList(),
-                onChanged: (v) => setState(() { _selectedLineB = v; _selectedStopB = null; _highlightedLine = v; }),
-              ),
-            ),
-            const SizedBox(width: 6),
-            Expanded(
-              flex: 2,
-              child: _MiniDropdown<String>(
-                value: _selectedStopB,
-                hint: 'Zastávka',
-                items: stopsB.map((s) => DropdownMenuItem(value: s.key, child: Text(s.value))).toList(),
-                onChanged: (v) => setState(() => _selectedStopB = v),
-              ),
-            ),
-          ]),
-          const SizedBox(height: 8),
-          Align(
-            alignment: Alignment.centerRight,
-            child: ElevatedButton.icon(
-              onPressed: canSync ? () => _showSyncDialog(context, state) : null,
-              icon: const Icon(Icons.sync, size: 16),
-              label: const Text('Synchronizovat'),
-              style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10), textStyle: const TextStyle(fontSize: 13)),
+          ),
+          SwitchListTile(
+            dense: true,
+            title: const Text('Пересадочные узлы', style: TextStyle(fontSize: 12)),
+            value: _showTransferNodes,
+            onChanged: (v) => setState(() => _showTransferNodes = v),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: ListView.builder(
+              itemCount: state.routes.length,
+              itemBuilder: (context, index) {
+                final route = state.routes[index];
+                final line = route.route.routeShortName;
+                final active = _activeLineNumbers.contains(line);
+                final color = _routeColors[index % _routeColors.length];
+                return CheckboxListTile(
+                  dense: true,
+                  value: active,
+                  activeColor: color,
+                  title: Text('Линия $line', style: const TextStyle(fontSize: 12)),
+                  onChanged: (v) {
+                    setState(() {
+                      if (v == true) {
+                        _activeLineNumbers.add(line);
+                      } else {
+                        _activeLineNumbers.remove(line);
+                      }
+                    });
+                  },
+                );
+              },
             ),
           ),
         ],
@@ -190,252 +684,379 @@ class _TransfersScreenState extends State<TransfersScreen> {
     );
   }
 
-  void _showSyncDialog(BuildContext context, AppState state) {
-    int waitMinutes = 2;
-    TransferPriority priority = TransferPriority.equal;
-
-    showDialog(
-      context: context,
-      builder: (ctx) {
-        return StatefulBuilder(builder: (ctx, setDS) {
-          return AlertDialog(
-            title: const Text('Nastavení synchronizace'),
-            content: SizedBox(
-              width: 420,
-              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(
-                  'Linka $_selectedLineA (${state.stops[_selectedStopA]?.stopName ?? _selectedStopA})'
-                  '  ↔  Linka $_selectedLineB (${state.stops[_selectedStopB]?.stopName ?? _selectedStopB})',
-                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 16),
-                Row(children: [
-                  const Text('Čas čekání (min):'),
-                  const SizedBox(width: 12),
-                  SizedBox(width: 60, child: TextFormField(initialValue: waitMinutes.toString(), keyboardType: TextInputType.number, textAlign: TextAlign.center, onChanged: (v) => waitMinutes = int.tryParse(v) ?? 2)),
-                ]),
-                const SizedBox(height: 16),
-                const Text('Priorita (kdo koho čeká):', style: TextStyle(fontWeight: FontWeight.w500)),
-                const SizedBox(height: 8),
-                _PriorityRadio(label: 'Oba čekají symetricky', value: TransferPriority.equal, groupValue: priority, onChanged: (v) => setDS(() => priority = v!)),
-                _PriorityRadio(label: 'Linka $_selectedLineB čeká na $_selectedLineA', value: TransferPriority.line1First, groupValue: priority, onChanged: (v) => setDS(() => priority = v!)),
-                _PriorityRadio(label: 'Linka $_selectedLineA čeká na $_selectedLineB', value: TransferPriority.line2First, groupValue: priority, onChanged: (v) => setDS(() => priority = v!)),
-              ]),
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Zrušit')),
-              ElevatedButton(
-                onPressed: () {
-                  state.addManualTransfer(
-                    stopId1: _selectedStopA!, stopName1: state.stops[_selectedStopA]?.stopName ?? _selectedStopA!,
-                    lineNumber1: _selectedLineA!, stopId2: _selectedStopB!, stopName2: state.stops[_selectedStopB]?.stopName ?? _selectedStopB!,
-                    lineNumber2: _selectedLineB!, maxWaitMinutes: waitMinutes,
-                  );
-                  final last = state.transferNodes.last;
-                  state.updateTransfer(last.id, priority: priority);
-                  Navigator.pop(ctx);
-                  setState(() { _selectedLineA = null; _selectedLineB = null; _selectedStopA = null; _selectedStopB = null; });
-                },
-                child: const Text('Synchronizovat'),
-              ),
-            ],
-          );
-        });
-      },
-    );
-  }
-
-  Widget _buildMapPanel(AppState state) {
-    const plzenCenter = LatLng(49.7475, 13.3776);
-    final polylines = <Polyline>[];
-    final allRoutes = state.routes;
-
-    for (int i = 0; i < allRoutes.length; i++) {
-      final route = allRoutes[i];
-      final lineName = route.route.routeShortName;
-      final isHL = _highlightedLine == null || _highlightedLine == lineName;
-      final color = _routeColors[i % _routeColors.length];
-
-      final fwd = route.forwardStopTimes;
-      if (fwd.length >= 2) {
-        final pts = _stopsToPoints(fwd, state.stops);
-        final roadKey = '${route.route.routeId}-0';
-        final road = OsrmService.instance.getPolyline(roadKey, pts, onReady: () { if (mounted) setState(() {}); });
-        final points = road ?? pts;
-        if (points.length >= 2) polylines.add(Polyline(points: points, color: isHL ? color : color.withValues(alpha: 0.15), strokeWidth: isHL ? 4.5 : 2.0));
-      }
-
-      final bwd = route.backwardStopTimes;
-      if (bwd.length >= 2) {
-        final pts = _stopsToPoints(bwd, state.stops);
-        final roadKey = '${route.route.routeId}-1';
-        final road = OsrmService.instance.getPolyline(roadKey, pts, onReady: () { if (mounted) setState(() {}); });
-        final points = road ?? pts;
-        if (points.length >= 2) polylines.add(Polyline(points: points, color: isHL ? color.withValues(alpha: 0.45) : color.withValues(alpha: 0.08), strokeWidth: isHL ? 3.0 : 1.5, pattern: const StrokePattern.dotted()));
-      }
+  Future<void> _handleStopTap(
+    String line,
+    String stopId,
+    String stopName,
+    AppState state,
+  ) async {
+    if (_pickA == null) {
+      setState(() {
+        _pickA = _MapPick(lineNumber: line, stopId: stopId, stopName: stopName);
+      });
+      return;
     }
 
-    final stopMarkers = <Marker>[];
-    final activeStopIds = <String>{};
-    for (final route in allRoutes) activeStopIds.addAll(route.allStopIds);
-    for (final stopId in activeStopIds) {
-      final stop = state.stops[stopId];
-      if (stop == null || stop.stopLat == 0) continue;
-      final belongsToSelected = (_selectedLineA != null && allRoutes.where((r) => r.route.routeShortName == _selectedLineA).any((r) => r.allStopIds.contains(stopId)))
-          || (_selectedLineB != null && allRoutes.where((r) => r.route.routeShortName == _selectedLineB).any((r) => r.allStopIds.contains(stopId)));
-      final isSelStop = stopId == _selectedStopA || stopId == _selectedStopB;
-      stopMarkers.add(Marker(
-        point: LatLng(stop.stopLat, stop.stopLon), width: isSelStop ? 22 : 14, height: isSelStop ? 22 : 14,
-        child: GestureDetector(
-          onTap: () => _onStopTapped(stopId, state),
-          child: Tooltip(message: stop.stopName, child: Container(
-            decoration: BoxDecoration(color: isSelStop ? const Color(0xFFE53E3E) : Colors.white, shape: BoxShape.circle, border: Border.all(color: isSelStop ? const Color(0xFFE53E3E) : belongsToSelected ? const Color(0xFFE67E22) : const Color(0xFF4299E1), width: isSelStop ? 3 : 2)),
-            child: Center(child: Icon(Icons.circle, size: isSelStop ? 8 : 5, color: isSelStop ? Colors.white : const Color(0xFF4299E1))),
-          )),
-        ),
-      ));
+    if (_pickB == null) {
+      setState(() {
+        _pickB = _MapPick(lineNumber: line, stopId: stopId, stopName: stopName);
+      });
+      await _tryCreateTransferFromPicks(state);
+      return;
     }
 
-    final nodePolylines = <Polyline>[];
-    final nodeMarkers = <Marker>[];
-    final enabledNodes = state.transferNodes.where((t) => t.isEnabled).toList();
-    for (final node in enabledNodes) {
-      final s1 = state.stops[node.stopId1]; final s2 = state.stops[node.stopId2];
-      if (s1 == null || s2 == null || s1.stopLat == 0 || s2.stopLat == 0) continue;
-      final p1 = LatLng(s1.stopLat, s1.stopLon); final p2 = LatLng(s2.stopLat, s2.stopLon);
-      if (node.stopId1 != node.stopId2) nodePolylines.add(Polyline(points: [p1, p2], color: const Color(0xFFE67E22), strokeWidth: 2.5, pattern: StrokePattern.dashed(segments: [8, 6])));
-      nodeMarkers.add(Marker(point: p1, width: 20, height: 20, child: Tooltip(
-        message: '${node.lineNumber1} ↔ ${node.lineNumber2}\n${node.stopName1}${node.isSameStop ? '' : ' / ${node.stopName2}'}',
-        child: Container(decoration: BoxDecoration(color: Colors.white, shape: BoxShape.circle, border: Border.all(color: const Color(0xFFE67E22), width: 2.5)), child: const Center(child: Icon(Icons.hub, size: 10, color: Color(0xFFE67E22)))),
-      )));
-    }
-
-    return Stack(children: [
-      FlutterMap(
-        options: MapOptions(initialCenter: plzenCenter, initialZoom: 13.0, minZoom: 10, maxZoom: 18),
-        children: [
-          TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', userAgentPackageName: 'cz.blackout.dispatch'),
-          PolylineLayer(polylines: polylines), PolylineLayer(polylines: nodePolylines),
-          MarkerLayer(markers: stopMarkers), MarkerLayer(markers: nodeMarkers),
-        ],
-      ),
-      Positioned(bottom: 12, left: 12, child: Container(
-        padding: const EdgeInsets.all(10),
-        decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.95), borderRadius: BorderRadius.circular(8), boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.12), blurRadius: 6)]),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-          const Text('Linky', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.textPrimary)),
-          const SizedBox(height: 4),
-          ...allRoutes.asMap().entries.map((e) {
-            final ln = e.value.route.routeShortName;
-            return GestureDetector(
-              onTap: () => setState(() { _highlightedLine = _highlightedLine == ln ? null : ln; }),
-              child: Padding(padding: const EdgeInsets.symmetric(vertical: 1), child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Container(width: 16, height: 4, decoration: BoxDecoration(color: _routeColors[e.key % _routeColors.length], borderRadius: BorderRadius.circular(2))),
-                const SizedBox(width: 6),
-                Text('$ln – ${e.value.route.routeLongName}', style: TextStyle(fontSize: 10, color: _highlightedLine == ln ? AppTheme.textPrimary : AppTheme.textSecondary, fontWeight: _highlightedLine == ln ? FontWeight.w700 : FontWeight.w400)),
-              ])),
-            );
-          }),
-        ]),
-      )),
-      Positioned(top: 10, right: 10, child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.92), borderRadius: BorderRadius.circular(6), boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.08), blurRadius: 4)]),
-        child: const Text('Klikni na linku v legendě → zvýraznění\nKlikni na zastávku → výběr pro synchronizaci', style: TextStyle(fontSize: 11, color: AppTheme.textMuted), textAlign: TextAlign.right),
-      )),
-    ]);
-  }
-
-  void _onStopTapped(String stopId, AppState state) {
-    String? belongsLine;
-    for (final route in state.routes) {
-      if (route.allStopIds.contains(stopId)) { belongsLine = route.route.routeShortName; break; }
-    }
     setState(() {
-      if (_selectedLineA == null || _selectedStopA == null) {
-        if (belongsLine != null) _selectedLineA = belongsLine;
-        _selectedStopA = stopId;
-      } else if (_selectedLineB == null || _selectedStopB == null) {
-        if (belongsLine != null && belongsLine != _selectedLineA) _selectedLineB = belongsLine;
-        _selectedStopB = stopId;
-      } else {
-        if (belongsLine != null) _selectedLineA = belongsLine;
-        _selectedStopA = stopId; _selectedLineB = null; _selectedStopB = null;
-      }
+      _pickA = _MapPick(lineNumber: line, stopId: stopId, stopName: stopName);
+      _pickB = null;
     });
   }
 
-  List<LatLng> _stopsToPoints(List<GtfsStopTime> stopTimes, Map<String, GtfsStop> stops) {
+  Future<void> _tryCreateTransferFromPicks(AppState state) async {
+    if (_pickA == null || _pickB == null) return;
+    final a = _pickA!;
+    final b = _pickB!;
+
+    if (a.lineNumber == b.lineNumber) {
+      _resetPicks();
+      return;
+    }
+
+    final s1 = state.stops[a.stopId];
+    final s2 = state.stops[b.stopId];
+    if (s1 == null || s2 == null) {
+      _resetPicks();
+      return;
+    }
+
+    final distance = const Distance().as(
+      LengthUnit.Meter,
+      LatLng(s1.stopLat, s1.stopLon),
+      LatLng(s2.stopLat, s2.stopLon),
+    );
+
+    if (distance > 300) {
+      _resetPicks();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Остановки дальше 300м, узел не создан.'),
+          backgroundColor: AppTheme.warning,
+        ),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (ctx) => _CreateTransferDialog(a: a, b: b),
+    );
+
+    if (result != null) {
+      state.addManualTransfer(
+        stopId1: a.stopId,
+        stopName1: a.stopName,
+        lineNumber1: a.lineNumber,
+        stopId2: b.stopId,
+        stopName2: b.stopName,
+        lineNumber2: b.lineNumber,
+        maxWaitMinutes: result['maxWait'] as int,
+        priority: result['priority'] as TransferPriority,
+      );
+    }
+
+    _resetPicks();
+  }
+
+  void _resetPicks() {
+    setState(() {
+      _pickA = null;
+      _pickB = null;
+    });
+  }
+
+  _PickType _pickTypeForStop(String stopId) {
+    if (_pickA?.stopId == stopId) return _PickType.a;
+    if (_pickB?.stopId == stopId) return _PickType.b;
+    return _PickType.none;
+  }
+
+  List<LatLng> _stopTimesToPoints(
+    List<GtfsStopTime> stopTimes,
+    Map<String, GtfsStop> stops,
+  ) {
     final points = <LatLng>[];
-    for (final st in stopTimes) { final s = stops[st.stopId]; if (s != null && s.stopLat != 0 && s.stopLon != 0) points.add(LatLng(s.stopLat, s.stopLon)); }
+    for (final st in stopTimes) {
+      final s = stops[st.stopId];
+      if (s == null || s.stopLat == 0 || s.stopLon == 0) continue;
+      points.add(LatLng(s.stopLat, s.stopLon));
+    }
     return points;
   }
 }
 
-class _MiniDropdown<T> extends StatelessWidget {
-  final T? value; final String hint; final List<DropdownMenuItem<T>> items; final ValueChanged<T?>? onChanged;
-  const _MiniDropdown({required this.value, required this.hint, required this.items, this.onChanged});
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(height: 34, child: DropdownButtonFormField<T>(
-      value: value,
-      decoration: InputDecoration(hintText: hint, isDense: true, contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6), border: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: const BorderSide(color: AppTheme.border))),
-      style: const TextStyle(fontSize: 12, color: AppTheme.textPrimary), items: items, onChanged: onChanged,
-    ));
-  }
-}
-
-class _PriorityRadio extends StatelessWidget {
-  final String label; final TransferPriority value; final TransferPriority groupValue; final ValueChanged<TransferPriority?> onChanged;
-  const _PriorityRadio({required this.label, required this.value, required this.groupValue, required this.onChanged});
-  @override
-  Widget build(BuildContext context) {
-    return Padding(padding: const EdgeInsets.symmetric(vertical: 2), child: Row(children: [
-      Radio<TransferPriority>(value: value, groupValue: groupValue, onChanged: onChanged, materialTapTargetSize: MaterialTapTargetSize.shrinkWrap, visualDensity: VisualDensity.compact),
-      const SizedBox(width: 4),
-      Expanded(child: Text(label, style: const TextStyle(fontSize: 13, color: AppTheme.textPrimary))),
-    ]));
-  }
-}
-
-class _TransferRow extends StatelessWidget {
+class _TransferTableRow extends StatelessWidget {
   final TransferNode transfer;
-  const _TransferRow({required this.transfer});
+  const _TransferTableRow({required this.transfer});
+
   @override
   Widget build(BuildContext context) {
     final state = context.read<AppState>();
     return Container(
-      margin: const EdgeInsets.only(bottom: 4),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(color: transfer.isEnabled ? AppTheme.surfaceWhite : AppTheme.surface, borderRadius: BorderRadius.circular(6), border: Border.all(color: transfer.isEnabled ? AppTheme.border : AppTheme.borderLight)),
-      child: Row(children: [
-        SizedBox(width: 36, height: 24, child: Transform.scale(scale: 0.7, child: Switch(value: transfer.isEnabled, onChanged: (v) => state.updateTransfer(transfer.id, isEnabled: v), activeTrackColor: AppTheme.accent))),
-        _LineBadge(lineNumber: transfer.lineNumber1),
-        const Padding(padding: EdgeInsets.symmetric(horizontal: 4), child: Icon(Icons.swap_horiz, size: 14, color: AppTheme.textMuted)),
-        _LineBadge(lineNumber: transfer.lineNumber2),
-        const SizedBox(width: 6),
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(transfer.isSameStop ? transfer.stopName1 : '${transfer.stopName1} / ${transfer.stopName2}', style: const TextStyle(fontSize: 11, color: AppTheme.textSecondary), overflow: TextOverflow.ellipsis),
-          Text('${transfer.maxWaitMinutes} min · ${transfer.priorityLabel}', style: const TextStyle(fontSize: 10, color: AppTheme.textMuted)),
-        ])),
-        if (transfer.isAutomatic)
-          Container(padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2), decoration: BoxDecoration(color: AppTheme.infoLight, borderRadius: BorderRadius.circular(3)), child: const Text('AUTO', style: TextStyle(fontSize: 9, fontWeight: FontWeight.w600, color: AppTheme.info)))
-        else
-          IconButton(onPressed: () => state.removeTransfer(transfer.id), icon: const Icon(Icons.close, size: 14), padding: EdgeInsets.zero, constraints: const BoxConstraints(minWidth: 24, minHeight: 24), color: AppTheme.textMuted, tooltip: 'Odebrat'),
-      ]),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: AppTheme.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              _LineChip(line: transfer.lineNumber1),
+              const SizedBox(width: 6),
+              const Icon(Icons.swap_horiz, size: 14, color: AppTheme.textMuted),
+              const SizedBox(width: 6),
+              _LineChip(line: transfer.lineNumber2),
+              const Spacer(),
+              Switch(
+                value: transfer.isEnabled,
+                onChanged: (v) => state.updateTransfer(transfer.id, isEnabled: v),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '${transfer.stopName1} ↔ ${transfer.stopName2}',
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              const Text('maxWait:', style: TextStyle(fontSize: 12, color: AppTheme.textMuted)),
+              const SizedBox(width: 8),
+              SizedBox(
+                width: 64,
+                child: TextFormField(
+                  initialValue: transfer.maxWaitMinutes.toString(),
+                  keyboardType: TextInputType.number,
+                  textAlign: TextAlign.center,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                    border: OutlineInputBorder(),
+                  ),
+                  onFieldSubmitted: (v) {
+                    final parsed = int.tryParse(v);
+                    if (parsed != null) {
+                      state.updateTransfer(transfer.id, maxWaitMinutes: parsed.clamp(1, 20));
+                    }
+                  },
+                ),
+              ),
+              const SizedBox(width: 12),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: transfer.isEnabled ? AppTheme.success.withValues(alpha: 0.14) : AppTheme.warning.withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  transfer.isEnabled ? 'Sync' : 'Wait',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: transfer.isEnabled ? AppTheme.success : AppTheme.warning,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          const Text('Приоритет:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppTheme.textPrimary)),
+          const SizedBox(height: 6),
+          DropdownButtonFormField<TransferPriority>(
+            value: transfer.priority,
+            decoration: const InputDecoration(
+              isDense: true,
+              contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              border: OutlineInputBorder(),
+            ),
+            items: [
+              DropdownMenuItem(
+                value: TransferPriority.equal,
+                child: Row(
+                  children: [
+                    const Icon(Icons.sync_alt, size: 16, color: AppTheme.textMuted),
+                    const SizedBox(width: 8),
+                    Text('Oba čekají (равный)', style: const TextStyle(fontSize: 12)),
+                  ],
+                ),
+              ),
+              DropdownMenuItem(
+                value: TransferPriority.line1First,
+                child: Row(
+                  children: [
+                    const Icon(Icons.arrow_forward, size: 16, color: AppTheme.primary),
+                    const SizedBox(width: 8),
+                    Text('${transfer.lineNumber2} čeká na ${transfer.lineNumber1}', style: const TextStyle(fontSize: 12)),
+                  ],
+                ),
+              ),
+              DropdownMenuItem(
+                value: TransferPriority.line2First,
+                child: Row(
+                  children: [
+                    const Icon(Icons.arrow_back, size: 16, color: AppTheme.primary),
+                    const SizedBox(width: 8),
+                    Text('${transfer.lineNumber1} čeká na ${transfer.lineNumber2}', style: const TextStyle(fontSize: 12)),
+                  ],
+                ),
+              ),
+            ],
+            onChanged: (value) {
+              if (value != null) {
+                state.updateTransfer(transfer.id, priority: value);
+              }
+            },
+          ),
+        ],
+      ),
     );
   }
 }
 
-class _LineBadge extends StatelessWidget {
-  final String lineNumber;
-  const _LineBadge({required this.lineNumber});
+class _LineChip extends StatelessWidget {
+  final String line;
+  const _LineChip({required this.line});
+
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-      decoration: BoxDecoration(color: AppTheme.primary, borderRadius: BorderRadius.circular(3)),
-      child: Text(lineNumber, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 11)),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: AppTheme.primary,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        line,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
     );
   }
+}
+
+class _CreateTransferDialog extends StatefulWidget {
+  final _MapPick a;
+  final _MapPick b;
+
+  const _CreateTransferDialog({required this.a, required this.b});
+
+  @override
+  State<_CreateTransferDialog> createState() => _CreateTransferDialogState();
+}
+
+class _CreateTransferDialogState extends State<_CreateTransferDialog> {
+  int _maxWait = 5;
+  TransferPriority _priority = TransferPriority.equal;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Создать узел пересадки'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Линия ${widget.a.lineNumber}: ${widget.a.stopName}'),
+            const SizedBox(height: 4),
+            Text('Линия ${widget.b.lineNumber}: ${widget.b.stopName}'),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                const Text('maxWaitMinutes'),
+                const SizedBox(width: 12),
+                SizedBox(
+                  width: 70,
+                  child: TextFormField(
+                    initialValue: _maxWait.toString(),
+                    keyboardType: TextInputType.number,
+                    onChanged: (v) {
+                      final parsed = int.tryParse(v);
+                      if (parsed != null) {
+                        _maxWait = parsed.clamp(1, 20);
+                      }
+                    },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            const Text('Приоритет:', style: TextStyle(fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            DropdownButtonFormField<TransferPriority>(
+              value: _priority,
+              decoration: const InputDecoration(
+                isDense: true,
+                contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                border: OutlineInputBorder(),
+              ),
+              items: [
+                const DropdownMenuItem(
+                  value: TransferPriority.equal,
+                  child: Text('Oba čekají (равный)'),
+                ),
+                DropdownMenuItem(
+                  value: TransferPriority.line1First,
+                  child: Text('${widget.b.lineNumber} čeká na ${widget.a.lineNumber}'),
+                ),
+                DropdownMenuItem(
+                  value: TransferPriority.line2First,
+                  child: Text('${widget.a.lineNumber} čeká na ${widget.b.lineNumber}'),
+                ),
+              ],
+              onChanged: (value) {
+                if (value != null) {
+                  setState(() => _priority = value);
+                }
+              },
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Отмена'),
+        ),
+        ElevatedButton(
+          onPressed: () => Navigator.pop(context, {'maxWait': _maxWait, 'priority': _priority}),
+          child: const Text('Создать'),
+        ),
+      ],
+    );
+  }
+}
+
+enum _PickType { none, a, b }
+
+class _MapPick {
+  final String lineNumber;
+  final String stopId;
+  final String stopName;
+
+  _MapPick({
+    required this.lineNumber,
+    required this.stopId,
+    required this.stopName,
+  });
 }

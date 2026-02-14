@@ -74,6 +74,7 @@ class GtfsTrip {
   final String tripId;
   final int directionId;
   final String tripShortName;
+  final String? shapeId;
 
   GtfsTrip({
     required this.routeId,
@@ -81,6 +82,23 @@ class GtfsTrip {
     required this.tripId,
     required this.directionId,
     this.tripShortName = '',
+    this.shapeId,
+  });
+}
+
+class GtfsShape {
+  final String shapeId;
+  final double shapePtLat;
+  final double shapePtLon;
+  final int shapePtSequence;
+  final double? shapeDistTraveled;
+
+  GtfsShape({
+    required this.shapeId,
+    required this.shapePtLat,
+    required this.shapePtLon,
+    required this.shapePtSequence,
+    this.shapeDistTraveled,
   });
 }
 
@@ -92,6 +110,7 @@ class GtfsStopTime {
   final int stopSequence;
   final int pickupType;
   final int dropOffType;
+  final double? shapeDistTraveled;
 
   GtfsStopTime({
     required this.tripId,
@@ -101,6 +120,7 @@ class GtfsStopTime {
     required this.stopSequence,
     this.pickupType = 0,
     this.dropOffType = 0,
+    this.shapeDistTraveled,
   });
 
   /// Deadhead stop = no boarding AND no alighting (pickup_type=3, drop_off_type=3)

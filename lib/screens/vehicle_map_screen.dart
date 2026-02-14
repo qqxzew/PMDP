@@ -1,16 +1,15 @@
-import 'dart:convert';
-
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
-import 'package:http/http.dart' as http;
 import '../providers/app_state.dart';
 import '../theme/app_theme.dart';
 import '../models/vehicle.dart';
 import '../models/timetable_models.dart';
 import '../models/gtfs_models.dart';
 import '../models/transfer_node.dart';
+import '../services/simulation_service.dart';
+import '../services/osrm_routing_service.dart';
 
 class VehicleMapScreen extends StatefulWidget {
   const VehicleMapScreen({super.key});
@@ -20,8 +19,7 @@ class VehicleMapScreen extends StatefulWidget {
 }
 
 class _VehicleMapScreenState extends State<VehicleMapScreen> {
-  String? _selectedVehicleId;
-  bool _showMap = true;
+  final Set<String> _selectedLineNumbers = {}; // Изначально пусто - карта пустая
 
   @override
   Widget build(BuildContext context) {
@@ -32,37 +30,29 @@ class _VehicleMapScreenState extends State<VehicleMapScreen> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(Icons.map_outlined,
-                    size: 64, color: AppTheme.textMuted),
+                Icon(Icons.map_outlined, size: 64, color: AppTheme.textMuted),
                 SizedBox(height: 16),
-                Text(
-                  'Žádná vozidla',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w600,
-                    color: AppTheme.textPrimary,
-                  ),
-                ),
+                Text('Žádná vozidla',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: AppTheme.textPrimary)),
                 SizedBox(height: 8),
-                Text(
-                  'Nejprve vygenerujte jízdní řády.',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: AppTheme.textSecondary,
-                  ),
-                ),
+                Text('Nejprve vygenerujte jízdní řády.',
+                    style: TextStyle(fontSize: 14, color: AppTheme.textSecondary)),
               ],
             ),
           );
         }
 
-        final selectedVehicle = _selectedVehicleId != null
-            ? state.vehicles.where((v) => v.id == _selectedVehicleId).firstOrNull
-            : null;
+        // Получаем уникальные номера линий
+        final lineNumbers = state.routes
+            .map((r) => r.route.routeShortName)
+            .where((n) => n.isNotEmpty)
+            .toSet()
+            .toList()
+          ..sort();
 
         return Row(
           children: [
-            // Panel se seznamem vozidel
+            // Left panel – line selection with checkboxes
             SizedBox(
               width: 320,
               child: Column(
@@ -73,22 +63,12 @@ class _VehicleMapScreenState extends State<VehicleMapScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text(
-                          'Mapa vozů',
-                          style: TextStyle(
-                            fontSize: 20,
-                            fontWeight: FontWeight.w700,
-                            color: AppTheme.textPrimary,
-                          ),
-                        ),
+                        const Text('Mapa vozů',
+                            style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: AppTheme.textPrimary)),
                         const SizedBox(height: 4),
                         Text(
-                          '${state.vehicles.length} vozidel celkem, '
-                          '${state.activeVehicles} v provozu',
-                          style: const TextStyle(
-                            fontSize: 13,
-                            color: AppTheme.textSecondary,
-                          ),
+                          'Vyberte linky pro zobrazení',
+                          style: const TextStyle(fontSize: 13, color: AppTheme.textSecondary),
                         ),
                       ],
                     ),
@@ -98,16 +78,26 @@ class _VehicleMapScreenState extends State<VehicleMapScreen> {
                     padding: const EdgeInsets.all(12),
                     child: Row(
                       children: [
-                        _StatusDot(
-                          color: const Color(0xFF68D391),
-                          label:
-                              'V provozu (${state.vehicles.where((v) => v.status == VehicleStatus.inService).length})',
-                        ),
-                        const SizedBox(width: 12),
-                        _StatusDot(
-                          color: const Color(0xFFA0AEC0),
-                          label:
-                              'Stojí (${state.vehicles.where((v) => v.status == VehicleStatus.idle).length})',
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () {
+                              setState(() {
+                                if (_selectedLineNumbers.length == lineNumbers.length) {
+                                  _selectedLineNumbers.clear();
+                                } else {
+                                  _selectedLineNumbers.addAll(lineNumbers);
+                                }
+                              });
+                            },
+                            style: OutlinedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 8),
+                              side: const BorderSide(color: AppTheme.border),
+                            ),
+                            child: Text(
+                              _selectedLineNumbers.length == lineNumbers.length ? 'Zrušit vše' : 'Vybrat vše',
+                              style: const TextStyle(fontSize: 13),
+                            ),
+                          ),
                         ),
                       ],
                     ),
@@ -115,15 +105,79 @@ class _VehicleMapScreenState extends State<VehicleMapScreen> {
                   const Divider(height: 1),
                   Expanded(
                     child: ListView.builder(
-                      itemCount: state.vehicles.length,
+                      itemCount: lineNumbers.length,
                       itemBuilder: (context, index) {
-                        final vehicle = state.vehicles[index];
-                        return _VehicleListItem(
-                          vehicle: vehicle,
-                          isSelected:
-                              _selectedVehicleId == vehicle.id,
-                          onTap: () => setState(
-                              () => _selectedVehicleId = vehicle.id),
+                        final lineNumber = lineNumbers[index];
+                        final isSelected = _selectedLineNumbers.contains(lineNumber);
+                        
+                        // Подсчитываем автобусы на этой линии
+                        final busCount = state.vehicles
+                            .where((v) => v.currentLineNumber == lineNumber)
+                            .length;
+
+                        return Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            onTap: () {
+                              setState(() {
+                                if (isSelected) {
+                                  _selectedLineNumbers.remove(lineNumber);
+                                } else {
+                                  _selectedLineNumbers.add(lineNumber);
+                                }
+                              });
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                              decoration: BoxDecoration(
+                                color: isSelected ? AppTheme.primary.withValues(alpha: 0.05) : Colors.transparent,
+                                border: const Border(bottom: BorderSide(color: AppTheme.borderLight)),
+                              ),
+                              child: Row(
+                                children: [
+                                  Checkbox(
+                                    value: isSelected,
+                                    onChanged: (val) {
+                                      setState(() {
+                                        if (val == true) {
+                                          _selectedLineNumbers.add(lineNumber);
+                                        } else {
+                                          _selectedLineNumbers.remove(lineNumber);
+                                        }
+                                      });
+                                    },
+                                    activeColor: AppTheme.primary,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: AppTheme.primary.withValues(alpha: 0.1),
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: Text(
+                                      lineNumber,
+                                      style: const TextStyle(
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w700,
+                                        color: AppTheme.primary,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Text(
+                                      '$busCount vozidel',
+                                      style: const TextStyle(
+                                        fontSize: 13,
+                                        color: AppTheme.textSecondary,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
                         );
                       },
                     ),
@@ -133,68 +187,17 @@ class _VehicleMapScreenState extends State<VehicleMapScreen> {
             ),
             Container(width: 1, color: AppTheme.border),
             Expanded(
-              child: selectedVehicle != null
-                  ? Column(
-                      children: [
-                        // Přepínač Mapa / Detail
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                          decoration: const BoxDecoration(
-                            border: Border(bottom: BorderSide(color: AppTheme.borderLight)),
-                          ),
-                          child: Row(
-                            children: [
-                              _TabButton(
-                                label: 'Mapa',
-                                icon: Icons.map_outlined,
-                                isSelected: _showMap,
-                                onTap: () => setState(() => _showMap = true),
-                              ),
-                              const SizedBox(width: 8),
-                              _TabButton(
-                                label: 'Detail a jízdy',
-                                icon: Icons.list_alt,
-                                isSelected: !_showMap,
-                                onTap: () => setState(() => _showMap = false),
-                              ),
-                            ],
-                          ),
-                        ),
-                        Expanded(
-                          child: _showMap
-                              ? _VehicleMapView(
-                                  vehicle: selectedVehicle,
-                                  stops: state.stops,
-                                  allVehicles: state.vehicles,
-                                  getVehicleJobs: state.getVehicleJobs,
-                                  routes: state.routes,
-                                  transferNodes: state.transferNodes,
-                                )
-                              : _VehicleDetail(
-                                  vehicle: selectedVehicle,
-                                  jobs: state.getVehicleJobs(selectedVehicle.id),
-                                  onSendMessage: (msg) {
-                                    state.sendMessage(selectedVehicle.id, msg);
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text('Zpráva odeslána'),
-                                        backgroundColor: AppTheme.success,
-                                      ),
-                                    );
-                                  },
-                                ),
-                        ),
-                      ],
-                    )
-                  : const Center(
-                      child: Text(
-                        'Vyberte vozidlo ze seznamu',
-                        style: TextStyle(
-                          fontSize: 14,
-                          color: AppTheme.textMuted,
-                        ),
-                      ),
-                    ),
+              child: _VehicleMapView(
+                selectedLineNumbers: _selectedLineNumbers,
+                stops: state.stops,
+                shapes: state.shapes,
+                allVehicles: state.vehicles,
+                getVehicleJobs: state.getVehicleJobs,
+                routes: state.routes,
+                transferNodes: state.transferNodes,
+                simulationService: state.simulationService,
+                osrmRoutingService: state.osrmRoutingService,
+              ),
             ),
           ],
         );
@@ -203,16 +206,14 @@ class _VehicleMapScreenState extends State<VehicleMapScreen> {
   }
 }
 
+// ── Vehicle list item ───────────────────────────────────────────────────────
+
 class _VehicleListItem extends StatelessWidget {
   final Vehicle vehicle;
   final bool isSelected;
   final VoidCallback onTap;
 
-  const _VehicleListItem({
-    required this.vehicle,
-    required this.isSelected,
-    required this.onTap,
-  });
+  const _VehicleListItem({required this.vehicle, required this.isSelected, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -239,63 +240,31 @@ class _VehicleListItem extends StatelessWidget {
         decoration: BoxDecoration(
           color: isSelected ? AppTheme.accent.withValues(alpha: 0.08) : null,
           border: Border(
-            left: BorderSide(
-              color: isSelected ? AppTheme.accent : Colors.transparent,
-              width: 3,
-            ),
+            left: BorderSide(color: isSelected ? AppTheme.accent : Colors.transparent, width: 3),
             bottom: const BorderSide(color: AppTheme.borderLight),
           ),
         ),
         child: Row(
           children: [
-            Container(
-              width: 10,
-              height: 10,
-              decoration: BoxDecoration(
-                color: statusColor,
-                shape: BoxShape.circle,
-              ),
-            ),
+            Container(width: 10, height: 10, decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle)),
             const SizedBox(width: 10),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    vehicle.id,
-                    style: const TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                      color: AppTheme.textPrimary,
-                    ),
-                  ),
+                  Text(vehicle.id, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.textPrimary)),
                   if (vehicle.currentLineNumber != null)
-                    Text(
-                      'Linka ${vehicle.currentLineNumber} | ${vehicle.statusLabel}',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: AppTheme.textSecondary,
-                      ),
-                    ),
+                    Text('Linka ${vehicle.currentLineNumber} | ${vehicle.statusLabel}',
+                        style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary)),
                 ],
               ),
             ),
             if (vehicle.delayMinutes > 0)
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: AppTheme.dangerLight,
-                  borderRadius: BorderRadius.circular(3),
-                ),
-                child: Text(
-                  '+${vehicle.delayMinutes}\'',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    color: AppTheme.danger,
-                  ),
-                ),
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(color: AppTheme.dangerLight, borderRadius: BorderRadius.circular(3)),
+                child: Text('+${vehicle.delayMinutes}\'',
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: AppTheme.danger)),
               ),
           ],
         ),
@@ -304,16 +273,14 @@ class _VehicleListItem extends StatelessWidget {
   }
 }
 
+// ── Vehicle detail with job list ────────────────────────────────────────────
+
 class _VehicleDetail extends StatefulWidget {
   final Vehicle vehicle;
   final List<TimetableJob> jobs;
   final ValueChanged<String> onSendMessage;
 
-  const _VehicleDetail({
-    required this.vehicle,
-    required this.jobs,
-    required this.onSendMessage,
-  });
+  const _VehicleDetail({required this.vehicle, required this.jobs, required this.onSendMessage});
 
   @override
   State<_VehicleDetail> createState() => _VehicleDetailState();
@@ -338,109 +305,52 @@ class _VehicleDetailState extends State<_VehicleDetail> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Hlavička vozidla
           Row(
             children: [
               Container(
-                width: 48,
-                height: 48,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: AppTheme.primary.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: const Icon(Icons.directions_bus,
-                    color: AppTheme.primary, size: 24),
+                width: 48, height: 48, alignment: Alignment.center,
+                decoration: BoxDecoration(color: AppTheme.primary.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(8)),
+                child: const Icon(Icons.directions_bus, color: AppTheme.primary, size: 24),
               ),
               const SizedBox(width: 16),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      vehicle.id,
-                      style: const TextStyle(
-                        fontSize: 22,
-                        fontWeight: FontWeight.w700,
-                        color: AppTheme.textPrimary,
-                      ),
-                    ),
-                    Text(
-                      vehicle.statusLabel,
-                      style: const TextStyle(
-                        fontSize: 14,
-                        color: AppTheme.textSecondary,
-                      ),
-                    ),
+                    Text(vehicle.id, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: AppTheme.textPrimary)),
+                    Text(vehicle.statusLabel, style: const TextStyle(fontSize: 14, color: AppTheme.textSecondary)),
                   ],
                 ),
               ),
               if (vehicle.delayMinutes > 0)
                 Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 12, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: AppTheme.dangerLight,
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Text(
-                    'Zpoždění: +${vehicle.delayMinutes} min',
-                    style: const TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                      color: AppTheme.danger,
-                    ),
-                  ),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(color: AppTheme.dangerLight, borderRadius: BorderRadius.circular(6)),
+                  child: Text('Zpoždění: +${vehicle.delayMinutes} min',
+                      style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.danger)),
                 ),
             ],
           ),
           const SizedBox(height: 20),
-
-          // Informační dlaždice
           Row(
             children: [
-              _InfoTile(
-                label: 'Linka',
-                value: vehicle.currentLineNumber ?? '--',
-              ),
+              _InfoTile(label: 'Linka', value: vehicle.currentLineNumber ?? '--'),
               const SizedBox(width: 12),
-              _InfoTile(
-                label: 'Směr',
-                value: vehicle.currentDirection ?? '--',
-              ),
+              _InfoTile(label: 'Směr', value: vehicle.currentDirection ?? '--'),
               const SizedBox(width: 12),
-              _InfoTile(
-                label: 'Aktuální zastávka',
-                value: vehicle.currentStopName ?? '--',
-              ),
+              _InfoTile(label: 'Aktuální zastávka', value: vehicle.currentStopName ?? '--'),
               const SizedBox(width: 12),
-              _InfoTile(
-                label: 'Celkem jízd',
-                value: '${jobs.length}',
-              ),
+              _InfoTile(label: 'Celkem jízd', value: '${jobs.length}'),
             ],
           ),
           const SizedBox(height: 24),
-
-          // Odeslání zprávy
-          const Text(
-            'Odeslat hlášení / zprávu',
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.w600,
-              color: AppTheme.textPrimary,
-            ),
-          ),
+          const Text('Odeslat hlášení / zprávu',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.textPrimary)),
           const SizedBox(height: 8),
           Row(
             children: [
               Expanded(
-                child: TextField(
-                  controller: _messageController,
-                  decoration: const InputDecoration(
-                    hintText: 'Napište zprávu pro řidiče...',
-                  ),
-                ),
+                child: TextField(controller: _messageController, decoration: const InputDecoration(hintText: 'Napište zprávu pro řidiče...')),
               ),
               const SizedBox(width: 8),
               ElevatedButton(
@@ -455,16 +365,8 @@ class _VehicleDetailState extends State<_VehicleDetail> {
             ],
           ),
           const SizedBox(height: 24),
-
-          // Všechny jízdy - rozbalovací
-          Text(
-            'Jízdní řád vozu (${jobs.length} jízd)',
-            style: const TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-              color: AppTheme.textPrimary,
-            ),
-          ),
+          Text('Jízdní řád vozu (${jobs.length} jízd)',
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: AppTheme.textPrimary)),
           const SizedBox(height: 8),
           ...jobs.map((job) => _ExpandableJobRow(job: job)),
         ],
@@ -473,10 +375,1089 @@ class _VehicleDetailState extends State<_VehicleDetail> {
   }
 }
 
+// ── Map view with simulation ────────────────────────────────────────────────
+
+class _VehicleMapView extends StatefulWidget {
+  final Set<String> selectedLineNumbers;
+  final Map<String, GtfsStop> stops;
+  final Map<String, List<GtfsShape>> shapes;
+  final List<Vehicle> allVehicles;
+  final List<TimetableJob> Function(String) getVehicleJobs;
+  final List<RouteData> routes;
+  final List<TransferNode> transferNodes;
+  final SimulationService simulationService;
+  final OsrmRoutingService osrmRoutingService;
+
+  const _VehicleMapView({
+    required this.selectedLineNumbers,
+    required this.stops,
+    required this.shapes,
+    required this.allVehicles,
+    required this.getVehicleJobs,
+    required this.routes,
+    required this.transferNodes,
+    required this.simulationService,
+    required this.osrmRoutingService,
+  });
+
+  @override
+  State<_VehicleMapView> createState() => _VehicleMapViewState();
+}
+
+class _VehicleMapViewState extends State<_VehicleMapView> {
+  late final MapController _mapController;
+  final Set<String> _visibleRouteIds = {};
+  bool _isLegendVisible = false;
+  bool _areTransferNodesVisible = true;
+  String? _selectedVehicleId; // Вибраний автобус для показу інфо
+  
+  // OSRM polylines cache: "routeId_direction" -> List<LatLng>
+  final Map<String, List<LatLng>> _osrmPolylines = {};
+  bool _isLoadingOsrmRoutes = false;
+
+  static const _routeColors = [
+    Color(0xFFE53E3E), Color(0xFF3182CE), Color(0xFF38A169), Color(0xFFD69E2E),
+    Color(0xFF805AD5), Color(0xFFDD6B20), Color(0xFF319795), Color(0xFFD53F8C),
+    Color(0xFF2B6CB0), Color(0xFF276749), Color(0xFFB83280), Color(0xFF9C4221),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _visibleRouteIds.clear();
+    _visibleRouteIds.addAll(widget.routes.map((r) => r.route.routeId));
+    _mapController = MapController();
+    widget.simulationService.addListener(_onSimTick);
+    // Не загружаем маршруты сразу - только когда выберут линию
+  }
+
+  @override
+  void didUpdateWidget(covariant _VehicleMapView old) {
+    super.didUpdateWidget(old);
+    if (widget.routes.length != old.routes.length) {
+       final newIds = widget.routes.map((r) => r.route.routeId).toSet();
+       final oldIds = old.routes.map((r) => r.route.routeId).toSet();
+       final added = newIds.difference(oldIds);
+       _visibleRouteIds.addAll(added);
+    }
+    if (old.simulationService != widget.simulationService) {
+      old.simulationService.removeListener(_onSimTick);
+      widget.simulationService.addListener(_onSimTick);
+    }
+    // Загружаем маршруты для новых выбранных линий
+    if (widget.selectedLineNumbers != old.selectedLineNumbers) {
+      _loadOsrmRoutesForSelected();
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.simulationService.removeListener(_onSimTick);
+    _mapController.dispose();
+    super.dispose();
+  }
+
+  void _onSimTick() {
+    if (mounted) setState(() {});
+  }
+
+  // Загружаем маршруты для выбранных линий из Mapbox
+  Future<void> _loadOsrmRoutesForSelected() async {
+    if (_isLoadingOsrmRoutes) return;
+    _isLoadingOsrmRoutes = true;
+
+    try {
+      final selectedRoutes = widget.routes.where((route) {
+        return widget.selectedLineNumbers.contains(route.route.routeShortName);
+      }).toList();
+
+      if (selectedRoutes.isEmpty) return;
+
+      debugPrint('🌐 Загрузка маршрутов Mapbox для ${selectedRoutes.length} линий...');
+      
+      for (final route in selectedRoutes) {
+        for (final dir in [0, 1]) {
+          final key = '${route.route.routeId}_$dir';
+          
+          // Пропускаем если уже загружен
+          if (_osrmPolylines.containsKey(key)) continue;
+
+          final stList = dir == 0 ? route.forwardStopTimes : route.backwardStopTimes;
+          if (stList.isEmpty) continue;
+
+          // Собираем точки остановок
+          final waypoints = <LatLng>[];
+          for (final st in stList) {
+            final stop = widget.stops[st.stopId];
+            if (stop != null && stop.stopLat != 0 && stop.stopLon != 0) {
+              waypoints.add(LatLng(stop.stopLat, stop.stopLon));
+            }
+          }
+
+          if (waypoints.length < 2) continue;
+
+          final cacheKey = widget.osrmRoutingService.makeRouteKeyFromStops(
+            stList.map((st) => st.stopId).toList(),
+            lineNumber: route.route.routeShortName,
+            direction: dir,
+          );
+          
+          try {
+            final polyline = await widget.osrmRoutingService.getRoutePolyline(
+              cacheKey: cacheKey,
+              waypoints: waypoints,
+            ).timeout(const Duration(seconds: 25));
+
+            if (polyline.length >= 2 && mounted) {
+              _osrmPolylines[key] = polyline;
+              debugPrint('✅ Mapbox: ${route.route.routeShortName} направление $dir (${polyline.length} точек)');
+              if (mounted) setState(() {});
+            }
+          } catch (e) {
+            debugPrint('⚠️ Mapbox ошибка для ${route.route.routeShortName}: $e');
+            _osrmPolylines[key] = waypoints;
+            if (mounted) setState(() {});
+          }
+        }
+      }
+    } finally {
+      _isLoadingOsrmRoutes = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const plzenCenter = LatLng(49.7475, 13.3776);
+    final sim = widget.simulationService;
+
+    if (!_isLoadingOsrmRoutes && widget.selectedLineNumbers.isNotEmpty) {
+      var needsLoad = false;
+      for (final route in widget.routes) {
+        if (!widget.selectedLineNumbers.contains(route.route.routeShortName)) continue;
+        final key0 = '${route.route.routeId}_0';
+        final key1 = '${route.route.routeId}_1';
+        if (!_osrmPolylines.containsKey(key0) || !_osrmPolylines.containsKey(key1)) {
+          needsLoad = true;
+          break;
+        }
+      }
+      if (needsLoad) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            _loadOsrmRoutesForSelected();
+          }
+        });
+      }
+    }
+
+    // ── Route polylines (OSRM with fallback) ──
+    final polylines = <Polyline>[];
+    final allRoutes = widget.routes;
+    
+    for (int i = 0; i < allRoutes.length; i++) {
+      final route = allRoutes[i];
+      final lineNumber = route.route.routeShortName;
+      
+      // Показываем линии ТОЛЬКО если они выбраны
+      if (widget.selectedLineNumbers.isEmpty || !widget.selectedLineNumbers.contains(lineNumber)) continue;
+      
+      final color = _routeColors[i % _routeColors.length];
+
+      for (final dir in [0, 1]) {
+        final key = '${route.route.routeId}_$dir';
+        List<LatLng> pts = [];
+
+        // Проверяем загруженный маршрут
+        if (_osrmPolylines.containsKey(key)) {
+          pts = _osrmPolylines[key]!;
+        } else {
+          // Еще не загружен - используем прямые линии
+          final stList = dir == 0 ? route.forwardStopTimes : route.backwardStopTimes;
+          pts = _stopTimesToPoints(stList);
+        }
+
+        if (pts.length >= 2) {
+          // Простая отрисовка: направление 0 - сплошная жирная линия, направление 1 - пунктир
+          polylines.add(Polyline(
+            points: pts,
+            color: dir == 0 ? color : color.withValues(alpha: 0.65),
+            strokeWidth: dir == 0 ? 4.5 : 3.5,
+            pattern: dir == 0 ? const StrokePattern.solid() : const StrokePattern.dotted(),
+          ));
+        }
+      }
+    }
+
+    // ── Stop markers (only for selected lines) ──
+    final activeStopIds = <String>{};
+    for (final route in allRoutes) {
+      final lineNumber = route.route.routeShortName;
+      // Показуємо зупинки тільки для вибраних ліній
+      if (widget.selectedLineNumbers.isEmpty || !widget.selectedLineNumbers.contains(lineNumber)) continue;
+      activeStopIds.addAll(route.allStopIds);
+    }
+    final stopMarkers = <Marker>[];
+    for (final stopId in activeStopIds) {
+      final stop = widget.stops[stopId];
+      if (stop == null || stop.stopLat == 0 || stop.stopLon == 0) continue;
+      stopMarkers.add(Marker(
+        point: LatLng(stop.stopLat, stop.stopLon),
+        width: 14, height: 14,
+        child: Tooltip(
+          message: stop.stopName,
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.white, shape: BoxShape.circle,
+              border: Border.all(color: const Color(0xFF4299E1), width: 2),
+            ),
+            child: const Center(child: Icon(Icons.circle, size: 5, color: Color(0xFF4299E1))),
+          ),
+        ),
+      ));
+    }
+
+    // ── Vehicle markers (simulation-aware) ──
+    final vehicleMarkers = <Marker>[];
+    final simPositions = sim.positions;
+
+    if (sim.isRunning && simPositions.isNotEmpty) {
+      // Use live simulation positions
+      for (final vp in simPositions.values) {
+        // Фильтр по выбранным линиям (показуємо тільки вибрані)
+        if (widget.selectedLineNumbers.isEmpty || !widget.selectedLineNumbers.contains(vp.lineNumber)) continue;
+        
+        vehicleMarkers.add(Marker(
+          point: vp.position,
+          width: _selectedVehicleId == vp.vehicleId ? 16 : 12,
+          height: _selectedVehicleId == vp.vehicleId ? 16 : 12,
+          child: GestureDetector(
+            onTap: () {
+              setState(() {
+                _selectedVehicleId = _selectedVehicleId == vp.vehicleId ? null : vp.vehicleId;
+              });
+            },
+            child: Container(
+              decoration: BoxDecoration(
+                color: const Color(0xFFDC143C), // Красный цвет
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: _selectedVehicleId == vp.vehicleId ? Colors.yellow : Colors.white,
+                  width: _selectedVehicleId == vp.vehicleId ? 2 : 1,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.3),
+                    blurRadius: 4,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ));
+      }
+    } else {
+      // Static fallback
+      for (final v in widget.allVehicles) {
+        // Фильтр по выбранным линиям (показуємо тільки вибрані)
+        if (widget.selectedLineNumbers.isEmpty || !widget.selectedLineNumbers.contains(v.currentLineNumber)) continue;
+        
+        if (v.currentStopName == null) continue;
+        final stopMatch = widget.stops.values.where((s) => s.stopName == v.currentStopName).firstOrNull;
+        if (stopMatch == null || stopMatch.stopLat == 0) continue;
+        vehicleMarkers.add(Marker(
+          point: LatLng(stopMatch.stopLat, stopMatch.stopLon),
+          width: _selectedVehicleId == v.id ? 16 : 12,
+          height: _selectedVehicleId == v.id ? 16 : 12,
+          child: GestureDetector(
+            onTap: () {
+              setState(() {
+                _selectedVehicleId = _selectedVehicleId == v.id ? null : v.id;
+              });
+            },
+            child: Container(
+              decoration: BoxDecoration(
+                color: const Color(0xFFDC143C), // Красный цвет
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: _selectedVehicleId == v.id ? Colors.yellow : Colors.white,
+                  width: _selectedVehicleId == v.id ? 2 : 1,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.3),
+                    blurRadius: 4,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ));
+      }
+    }
+
+    // ── Transfer node markers & polylines ──
+    final nodePolylines = <Polyline>[];
+    final nodeMarkers = <Marker>[];
+    final enabledNodes = _areTransferNodesVisible ? widget.transferNodes.where((t) => t.isEnabled).toList() : <TransferNode>[];
+
+    for (final node in enabledNodes) {
+      final stop1 = widget.stops[node.stopId1];
+      final stop2 = widget.stops[node.stopId2];
+      if (stop1 == null || stop2 == null) continue;
+      if (stop1.stopLat == 0 || stop2.stopLat == 0) continue;
+      final p1 = LatLng(stop1.stopLat, stop1.stopLon);
+      final p2 = LatLng(stop2.stopLat, stop2.stopLon);
+
+      if (node.stopId1 != node.stopId2) {
+        nodePolylines.add(Polyline(
+          points: [p1, p2], color: const Color(0xFFE67E22), strokeWidth: 2.5,
+          pattern: StrokePattern.dashed(segments: [8, 6]),
+        ));
+      }
+
+      nodeMarkers.add(Marker(
+        point: p1, width: 20, height: 20,
+        child: Tooltip(
+          message: 'Uzlový bod: ${node.lineNumber1} ↔ ${node.lineNumber2}\n${node.stopName1}${node.stopId1 != node.stopId2 ? " / ${node.stopName2}" : ""}',
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.white, shape: BoxShape.circle,
+              border: Border.all(color: const Color(0xFFE67E22), width: 2.5),
+            ),
+            child: const Center(child: Icon(Icons.hub, size: 10, color: Color(0xFFE67E22))),
+          ),
+        ),
+      ));
+      if (node.stopId1 != node.stopId2) {
+        nodeMarkers.add(Marker(
+          point: p2, width: 16, height: 16,
+          child: Container(
+            decoration: BoxDecoration(
+              color: const Color(0xFFE67E22), shape: BoxShape.circle,
+              border: Border.all(color: Colors.white, width: 1.5),
+            ),
+          ),
+        ));
+      }
+    }
+
+    return Stack(
+      children: [
+        FlutterMap(
+          mapController: _mapController,
+          options: MapOptions(initialCenter: plzenCenter, initialZoom: 13.0, minZoom: 10, maxZoom: 18),
+          children: [
+            TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', userAgentPackageName: 'cz.blackout.dispatch'),
+            PolylineLayer(polylines: polylines),
+            PolylineLayer(polylines: nodePolylines),
+            MarkerLayer(markers: stopMarkers),
+            MarkerLayer(markers: nodeMarkers),
+            MarkerLayer(markers: vehicleMarkers),
+          ],
+        ),
+
+        // ── Simulation control bar ──
+        Positioned(
+          top: 12, left: 12, right: 12,
+          child: _SimulationControlBar(sim: sim),
+        ),
+
+        // ── Vehicle info card (when selected) ──
+        if (_selectedVehicleId != null)
+          Positioned(
+            top: 70, right: 12,
+            child: _VehicleInfoCard(
+              vehicleId: _selectedVehicleId!,
+              allVehicles: widget.allVehicles,
+              simPosition: simPositions[_selectedVehicleId],
+              getVehicleJobs: widget.getVehicleJobs,
+              onClose: () => setState(() => _selectedVehicleId = null),
+            ),
+          ),
+
+        // ── Loading indicator ──
+        if (_isLoadingOsrmRoutes)
+          Positioned(
+            bottom: 20, left: 20,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.95),
+                borderRadius: BorderRadius.circular(8),
+                boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.2), blurRadius: 8)],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 20, height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.primary),
+                  ),
+                  const SizedBox(width: 12),
+                  Text(
+                    'Загрузка маршрутів...',
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: AppTheme.textPrimary),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+        // ── Legend Toggle ──
+        Positioned(
+          bottom: 20,
+          right: 20,
+          child: FloatingActionButton.small(
+            heroTag: 'legendToggle',
+            backgroundColor: Colors.white,
+            child: Icon(_isLegendVisible ? Icons.visibility_off : Icons.visibility, color: AppTheme.textPrimary),
+            onPressed: () => setState(() => _isLegendVisible = !_isLegendVisible),
+          ),
+        ),
+
+        // ── Legend Panel ──
+        if (_isLegendVisible)
+          Positioned(
+            bottom: 70, // Above button
+            right: 20,
+            width: 200,
+            height: 300,
+            child: Container(
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.95),
+                borderRadius: BorderRadius.circular(8),
+                boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.1), blurRadius: 10)],
+              ),
+              child: Column(
+                children: [
+                   Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: AppTheme.borderLight))),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text('Zobrazit linky', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                        InkWell(
+                          onTap: () {
+                            setState(() {
+                              if (_visibleRouteIds.length == widget.routes.length) {
+                                _visibleRouteIds.clear();
+                              } else {
+                                _visibleRouteIds.addAll(widget.routes.map((r) => r.route.routeId));
+                              }
+                            });
+                          },
+                          child: Text(
+                            _visibleRouteIds.length == widget.routes.length ? 'Skrýt vše' : 'Vše',
+                            style: const TextStyle(fontSize: 11, color: AppTheme.primary, fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Transfer Nodes Toggle
+                  Material(
+                    color: Colors.transparent,
+                    child: CheckboxListTile(
+                      dense: true,
+                      visualDensity: VisualDensity.compact,
+                      title: const Text('Přestupní uzly', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                      activeColor: const Color(0xFFE67E22),
+                      value: _areTransferNodesVisible,
+                      onChanged: (val) => setState(() => _areTransferNodesVisible = val ?? false),
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Expanded(
+                    child: ListView.builder(
+                      padding: EdgeInsets.zero,
+                      itemCount: widget.routes.length,
+                      itemBuilder: (context, index) {
+                        final route = widget.routes[index];
+                        final isVisible = _visibleRouteIds.contains(route.route.routeId);
+                        final color = _routeColors[index % _routeColors.length];
+                        
+                        return Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            onTap: () {
+                              setState(() {
+                                if (isVisible) {
+                                  _visibleRouteIds.remove(route.route.routeId);
+                                } else {
+                                  _visibleRouteIds.add(route.route.routeId);
+                                }
+                              });
+                            },
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              child: Row(
+                                children: [
+                                  Container(
+                                    width: 16, height: 16,
+                                    decoration: BoxDecoration(
+                                      color: isVisible ? color : Colors.white,
+                                      shape: BoxShape.circle,
+                                      border: Border.all(color: isVisible ? color : Colors.grey.shade400, width: 2),
+                                    ),
+                                    child: isVisible ? const Icon(Icons.check, size: 10, color: Colors.white) : null,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(
+                                      'Linka ${route.route.routeShortName}',
+                                      style: TextStyle(
+                                        color: isVisible ? AppTheme.textPrimary : AppTheme.textMuted,
+                                        fontWeight: isVisible ? FontWeight.w600 : FontWeight.normal,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  List<LatLng> _stopTimesToPoints(List<GtfsStopTime> stopTimes) {
+    final points = <LatLng>[];
+    for (final st in stopTimes) {
+      final stop = widget.stops[st.stopId];
+      if (stop != null && stop.stopLat != 0 && stop.stopLon != 0) {
+        points.add(LatLng(stop.stopLat, stop.stopLon));
+      }
+    }
+    return points;
+  }
+}
+
+// ── Simulation control bar ──────────────────────────────────────────────────
+
+class _SimulationControlBar extends StatelessWidget {
+  final SimulationService sim;
+  const _SimulationControlBar({required this.sim});
+
+  @override
+  Widget build(BuildContext context) {
+    final st = sim.simTime;
+    final timeStr = '${st.hour.toString().padLeft(2, "0")}:${st.minute.toString().padLeft(2, "0")}:${st.second.toString().padLeft(2, "0")}';
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.96),
+        borderRadius: BorderRadius.circular(10),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.12), blurRadius: 8)],
+      ),
+      child: Row(
+        children: [
+          // Play / Pause
+          IconButton(
+            icon: Icon(sim.isRunning ? Icons.pause_rounded : Icons.play_arrow_rounded, size: 28),
+            color: AppTheme.primary,
+            tooltip: sim.isRunning ? 'Pozastavit' : 'Spustit simulaci',
+            onPressed: () {
+              if (sim.isRunning) {
+                sim.pause();
+              } else {
+                sim.start();
+              }
+            },
+          ),
+          // Stop
+          IconButton(
+            icon: const Icon(Icons.stop_rounded, size: 24),
+            color: AppTheme.danger,
+            tooltip: 'Zastavit simulaci',
+            onPressed: () => sim.stop(),
+          ),
+          const SizedBox(width: 8),
+
+          // Time display
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: AppTheme.surface, borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: AppTheme.border),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.access_time, size: 14, color: AppTheme.textSecondary),
+                const SizedBox(width: 6),
+                Text(timeStr,
+                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, fontFamily: 'monospace', color: AppTheme.textPrimary)),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+
+          // Speed label
+          const Text('Rychlost:', style: TextStyle(fontSize: 12, color: AppTheme.textSecondary)),
+          const SizedBox(width: 6),
+
+          // Speed buttons
+          ...[1.0, 5.0, 15.0, 30.0].map((s) => Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 2),
+                child: _SpeedChip(
+                  label: '${s.toInt()}×',
+                  isActive: (sim.speedMultiplier - s).abs() < 0.1,
+                  onTap: () => sim.setSpeed(s),
+                ),
+              )),
+
+          const Spacer(),
+
+          // Status indicator
+          if (sim.isRunning)
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              Container(width: 8, height: 8, decoration: const BoxDecoration(color: Color(0xFF38A169), shape: BoxShape.circle)),
+              const SizedBox(width: 6),
+              Text('${sim.positions.length} vozidel aktivních',
+                  style: const TextStyle(fontSize: 11, color: AppTheme.textSecondary)),
+            ])
+          else
+            const Text('Simulace zastavena', style: TextStyle(fontSize: 11, color: AppTheme.textMuted)),
+        ],
+      ),
+    );
+  }
+}
+
+class _SpeedChip extends StatelessWidget {
+  final String label;
+  final bool isActive;
+  final VoidCallback onTap;
+  const _SpeedChip({required this.label, required this.isActive, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(4),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: isActive ? AppTheme.primary : AppTheme.surface,
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: isActive ? AppTheme.primary : AppTheme.border),
+        ),
+        child: Text(label,
+            style: TextStyle(
+              fontSize: 11, fontWeight: FontWeight.w600,
+              color: isActive ? Colors.white : AppTheme.textSecondary,
+            )),
+      ),
+    );
+  }
+}
+
+// ── Vehicle info card ───────────────────────────────────────────────────────
+
+class _VehicleInfoCard extends StatelessWidget {
+  final String vehicleId;
+  final List<Vehicle> allVehicles;
+  final VehiclePosition? simPosition;
+  final List<TimetableJob> Function(String) getVehicleJobs;
+  final VoidCallback onClose;
+  
+  const _VehicleInfoCard({
+    required this.vehicleId,
+    required this.allVehicles,
+    required this.getVehicleJobs,
+    required this.onClose,
+    this.simPosition,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final vehicle = allVehicles.where((v) => v.id == vehicleId).firstOrNull;
+    if (vehicle == null) return const SizedBox.shrink();
+    
+    final jobs = getVehicleJobs(vehicleId);
+    final currentJob = jobs.where((j) => 
+      j.startTime != null && 
+      j.endTime != null && 
+      DateTime.now().isAfter(j.startTime!) && 
+      DateTime.now().isBefore(j.endTime!)
+    ).firstOrNull;
+
+    return Container(
+      width: 280,
+      constraints: const BoxConstraints(maxHeight: 400),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.97),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppTheme.primary.withValues(alpha: 0.3), width: 2),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.15), blurRadius: 12)],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Header
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: AppTheme.primary.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  vehicle.id,
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: AppTheme.primary,
+                  ),
+                ),
+              ),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.close, size: 20),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+                onPressed: onClose,
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          
+          // Line info
+          if (simPosition != null) ...[
+            _InfoRow(
+              icon: Icons.route,
+              label: 'Linka',
+              value: simPosition!.lineNumber,
+            ),
+            const SizedBox(height: 8),
+            if (simPosition!.currentStopName != null)
+              _InfoRow(
+                icon: Icons.place,
+                label: 'Aktuální',
+                value: simPosition!.currentStopName!,
+              ),
+            const SizedBox(height: 8),
+            if (simPosition!.nextStopName != null)
+              _InfoRow(
+                icon: Icons.arrow_forward,
+                label: 'Další',
+                value: simPosition!.nextStopName!,
+              ),
+            const SizedBox(height: 8),
+            if (simPosition!.isWaiting)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFFF3E0),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.hourglass_top, size: 14, color: Color(0xFFE67E22)),
+                    SizedBox(width: 6),
+                    Text(
+                      'Čeká na přestup',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFFE67E22),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ] else ...[
+            if (vehicle.currentLineNumber != null)
+              _InfoRow(
+                icon: Icons.route,
+                label: 'Linka',
+                value: vehicle.currentLineNumber!,
+              ),
+            const SizedBox(height: 8),
+            if (vehicle.currentStopName != null)
+              _InfoRow(
+                icon: Icons.place,
+                label: 'Zastávka',
+                value: vehicle.currentStopName!,
+              ),
+          ],
+          
+          const SizedBox(height: 12),
+          const Divider(height: 1),
+          const SizedBox(height: 12),
+          
+          // Job list
+          Text(
+            'Jízdy (${jobs.length})',
+            style: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: AppTheme.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 8),
+          
+          if (jobs.isEmpty)
+            const Text(
+              'Žádné jízdy',
+              style: TextStyle(fontSize: 12, color: AppTheme.textMuted),
+            )
+          else
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: jobs.length > 5 ? 5 : jobs.length,
+                itemBuilder: (context, index) {
+                  final job = jobs[index];
+                  final isCurrent = job == currentJob;
+                  return Container(
+                    margin: const EdgeInsets.only(bottom: 6),
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: isCurrent 
+                        ? AppTheme.success.withValues(alpha: 0.1)
+                        : AppTheme.surface,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: isCurrent 
+                          ? AppTheme.success 
+                          : AppTheme.borderLight,
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            if (isCurrent)
+                              const Icon(
+                                Icons.play_circle,
+                                size: 14,
+                                color: AppTheme.success,
+                              ),
+                            if (isCurrent) const SizedBox(width: 4),
+                            Text(
+                              job.lineNumber,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                                color: isCurrent ? AppTheme.success : AppTheme.primary,
+                              ),
+                            ),
+                            const Spacer(),
+                            Expanded(
+                              child: Text(
+                                '${job.stops.first.name} → ${job.stops.last.name}',
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  color: AppTheme.textSecondary,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.right,
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (job.startTime != null && job.endTime != null) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            '${_formatTime(job.startTime!)} - ${_formatTime(job.endTime!)}',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: AppTheme.textMuted,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          
+          if (jobs.length > 5)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                '+ ${jobs.length - 5} dalších jízd',
+                style: const TextStyle(
+                  fontSize: 11,
+                  color: AppTheme.textMuted,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+  
+  String _formatTime(DateTime dt) {
+    return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+  }
+}
+
+class _InfoRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String value;
+  
+  const _InfoRow({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+  
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Icon(icon, size: 14, color: AppTheme.textMuted),
+        const SizedBox(width: 6),
+        Text(
+          '$label:',
+          style: const TextStyle(
+            fontSize: 12,
+            color: AppTheme.textSecondary,
+          ),
+        ),
+        const SizedBox(width: 4),
+        Expanded(
+          child: Text(
+            value,
+            style: const TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: AppTheme.textPrimary,
+            ),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ── Live vehicle marker (simulation mode) ───────────────────────────────────
+
+class _LiveVehicleMarker extends StatelessWidget {
+  final String vehicleId;
+  final String lineNumber;
+  final bool isSelected;
+  final bool isWaiting;
+  final double heading;
+  final String? currentStop;
+  final String? nextStop;
+
+  const _LiveVehicleMarker({
+    required this.vehicleId,
+    required this.lineNumber,
+    required this.isSelected,
+    required this.isWaiting,
+    required this.heading,
+    this.currentStop,
+    this.nextStop,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bgColor = isWaiting
+        ? const Color(0xFFE67E22)
+        : isSelected
+            ? AppTheme.primary
+            : const Color(0xFF38A169);
+
+    return Tooltip(
+      message: '$vehicleId – Linka $lineNumber\n${currentStop ?? ""}${nextStop != null ? " → $nextStop" : ""}${isWaiting ? "\n⏳ Čeká na přestup" : ""}',
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: bgColor,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white, width: isSelected ? 2.5 : 1.5),
+          boxShadow: [BoxShadow(color: bgColor.withValues(alpha: 0.4), blurRadius: isSelected ? 8 : 4)],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(isWaiting ? Icons.hourglass_top : Icons.directions_bus, size: 12, color: Colors.white),
+            const SizedBox(width: 2),
+            Text(lineNumber,
+                style: TextStyle(fontSize: isSelected ? 11 : 10, fontWeight: FontWeight.w700, color: Colors.white)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── Static vehicle marker (no simulation) ───────────────────────────────────
+
+class _StaticVehicleMarker extends StatelessWidget {
+  final String vehicleId;
+  final String? lineNumber;
+  final bool isSelected;
+  final bool isInService;
+  final int delay;
+
+  const _StaticVehicleMarker({
+    required this.vehicleId,
+    this.lineNumber,
+    required this.isSelected,
+    required this.isInService,
+    required this.delay,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bgColor = isSelected
+        ? AppTheme.primary
+        : isInService ? const Color(0xFF38A169) : const Color(0xFFA0AEC0);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: bgColor,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white, width: isSelected ? 2.5 : 1.5),
+        boxShadow: [BoxShadow(color: bgColor.withValues(alpha: 0.4), blurRadius: isSelected ? 8 : 4)],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.directions_bus, size: 12, color: Colors.white),
+          const SizedBox(width: 2),
+          Text(lineNumber ?? vehicleId,
+              style: TextStyle(fontSize: isSelected ? 11 : 10, fontWeight: FontWeight.w700, color: Colors.white)),
+          if (delay > 0) ...[
+            const SizedBox(width: 2),
+            Text('+$delay', style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w600, color: Color(0xFFFFD700))),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// ── Shared small widgets ────────────────────────────────────────────────────
+
 class _InfoTile extends StatelessWidget {
   final String label;
   final String value;
-
   const _InfoTile({required this.label, required this.value});
 
   @override
@@ -485,31 +1466,15 @@ class _InfoTile extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
-          color: AppTheme.surfaceWhite,
-          borderRadius: BorderRadius.circular(6),
+          color: AppTheme.surfaceWhite, borderRadius: BorderRadius.circular(6),
           border: Border.all(color: AppTheme.border),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              label,
-              style: const TextStyle(
-                fontSize: 11,
-                color: AppTheme.textMuted,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
+            Text(label, style: const TextStyle(fontSize: 11, color: AppTheme.textMuted, fontWeight: FontWeight.w500)),
             const SizedBox(height: 4),
-            Text(
-              value,
-              style: const TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-                color: AppTheme.textPrimary,
-              ),
-              overflow: TextOverflow.ellipsis,
-            ),
+            Text(value, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: AppTheme.textPrimary), overflow: TextOverflow.ellipsis),
           ],
         ),
       ),
@@ -519,9 +1484,7 @@ class _InfoTile extends StatelessWidget {
 
 class _ExpandableJobRow extends StatefulWidget {
   final TimetableJob job;
-
   const _ExpandableJobRow({required this.job});
-
   @override
   State<_ExpandableJobRow> createState() => _ExpandableJobRowState();
 }
@@ -537,8 +1500,7 @@ class _ExpandableJobRowState extends State<_ExpandableJobRow> {
     return Container(
       margin: const EdgeInsets.only(bottom: 4),
       decoration: BoxDecoration(
-        color: AppTheme.surface,
-        borderRadius: BorderRadius.circular(4),
+        color: AppTheme.surface, borderRadius: BorderRadius.circular(4),
         border: Border.all(color: AppTheme.borderLight),
       ),
       child: Column(
@@ -551,64 +1513,22 @@ class _ExpandableJobRowState extends State<_ExpandableJobRow> {
               child: Row(
                 children: [
                   Container(
-                    width: 32,
-                    height: 22,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      color: AppTheme.primary,
-                      borderRadius: BorderRadius.circular(3),
-                    ),
-                    child: Text(
-                      job.lineNumber,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
-                        fontSize: 11,
-                      ),
-                    ),
+                    width: 32, height: 22, alignment: Alignment.center,
+                    decoration: BoxDecoration(color: AppTheme.primary, borderRadius: BorderRadius.circular(3)),
+                    child: Text(job.lineNumber, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 11)),
                   ),
                   const SizedBox(width: 10),
-                  Text(
-                    _formatTime(first?.departureTime),
-                    style: const TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: AppTheme.textPrimary,
-                    ),
-                  ),
+                  Text(_fmtTime(first?.departureTime), style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: AppTheme.textPrimary)),
                   const Text(' – ', style: TextStyle(color: AppTheme.textMuted)),
-                  Text(
-                    _formatTime(last?.arrivalTime),
-                    style: const TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: AppTheme.textPrimary,
-                    ),
-                  ),
+                  Text(_fmtTime(last?.arrivalTime), style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: AppTheme.textPrimary)),
                   const SizedBox(width: 12),
                   Expanded(
-                    child: Text(
-                      '${first?.name ?? "?"} → ${last?.name ?? "?"}',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: AppTheme.textSecondary,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
+                    child: Text('${first?.name ?? "?"} → ${last?.name ?? "?"}',
+                        style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary), overflow: TextOverflow.ellipsis),
                   ),
-                  Text(
-                    '${job.stops.length} zast.',
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: AppTheme.textMuted,
-                    ),
-                  ),
+                  Text('${job.stops.length} zast.', style: const TextStyle(fontSize: 11, color: AppTheme.textMuted)),
                   const SizedBox(width: 4),
-                  Icon(
-                    _expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-                    size: 18,
-                    color: AppTheme.textMuted,
-                  ),
+                  Icon(_expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down, size: 18, color: AppTheme.textMuted),
                 ],
               ),
             ),
@@ -625,30 +1545,15 @@ class _ExpandableJobRowState extends State<_ExpandableJobRow> {
                       children: [
                         SizedBox(
                           width: 50,
-                          child: Text(
-                            _formatTime(stop.departureTime ?? stop.arrivalTime),
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: stop.isTerminus ? FontWeight.w600 : FontWeight.w400,
-                              color: AppTheme.textPrimary,
-                            ),
-                          ),
+                          child: Text(_fmtTime(stop.departureTime ?? stop.arrivalTime),
+                              style: TextStyle(fontSize: 12, fontWeight: stop.isTerminus ? FontWeight.w600 : FontWeight.w400, color: AppTheme.textPrimary)),
                         ),
-                        Icon(
-                          stop.isTerminus ? Icons.radio_button_checked : Icons.circle,
-                          size: stop.isTerminus ? 10 : 6,
-                          color: stop.isTerminus ? AppTheme.primary : AppTheme.accent,
-                        ),
+                        Icon(stop.isTerminus ? Icons.radio_button_checked : Icons.circle,
+                            size: stop.isTerminus ? 10 : 6, color: stop.isTerminus ? AppTheme.primary : AppTheme.accent),
                         const SizedBox(width: 8),
                         Expanded(
-                          child: Text(
-                            stop.name,
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: stop.isTerminus ? FontWeight.w600 : FontWeight.w400,
-                              color: AppTheme.textPrimary,
-                            ),
-                          ),
+                          child: Text(stop.name,
+                              style: TextStyle(fontSize: 12, fontWeight: stop.isTerminus ? FontWeight.w600 : FontWeight.w400, color: AppTheme.textPrimary)),
                         ),
                       ],
                     ),
@@ -662,564 +1567,9 @@ class _ExpandableJobRowState extends State<_ExpandableJobRow> {
     );
   }
 
-  String _formatTime(DateTime? dt) {
+  String _fmtTime(DateTime? dt) {
     if (dt == null) return '--:--';
-    return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-  }
-}
-
-/// Mapový pohled na vozidla – OpenStreetMap s trasami a zastávkami
-class _VehicleMapView extends StatefulWidget {
-  final Vehicle vehicle;
-  final Map<String, GtfsStop> stops;
-  final List<Vehicle> allVehicles;
-  final List<TimetableJob> Function(String) getVehicleJobs;
-  final List<RouteData> routes;
-  final List<TransferNode> transferNodes;
-
-  const _VehicleMapView({
-    required this.vehicle,
-    required this.stops,
-    required this.allVehicles,
-    required this.getVehicleJobs,
-    required this.routes,
-    required this.transferNodes,
-  });
-
-  @override
-  State<_VehicleMapView> createState() => _VehicleMapViewState();
-}
-
-class _VehicleMapViewState extends State<_VehicleMapView> {
-  late final MapController _mapController;
-  final Map<String, List<LatLng>> _roadPolylineCache = {};
-  final Set<String> _pendingRoadRequests = {};
-
-  // Distinct colors for route lines
-  static const _routeColors = [
-    Color(0xFFE53E3E), // red
-    Color(0xFF3182CE), // blue
-    Color(0xFF38A169), // green
-    Color(0xFFD69E2E), // yellow
-    Color(0xFF805AD5), // purple
-    Color(0xFFDD6B20), // orange
-    Color(0xFF319795), // teal
-    Color(0xFFD53F8C), // pink
-    Color(0xFF2B6CB0), // dark blue
-    Color(0xFF276749), // dark green
-    Color(0xFFB83280), // magenta
-    Color(0xFF9C4221), // brown
-  ];
-
-  @override
-  void initState() {
-    super.initState();
-    _mapController = MapController();
-  }
-
-  @override
-  void dispose() {
-    _mapController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    // Center of Plzeň
-    const plzenCenter = LatLng(49.7475, 13.3776);
-
-    // Build route polylines
-    final polylines = <Polyline>[];
-    final allRoutes = widget.routes;
-
-    for (int i = 0; i < allRoutes.length; i++) {
-      final route = allRoutes[i];
-      final color = _routeColors[i % _routeColors.length];
-
-      // Forward direction
-      final fwdStops = route.forwardStopTimes;
-      if (fwdStops.length >= 2) {
-        final fallbackPoints = _stopTimesToPoints(fwdStops);
-        final roadKey = '${route.route.routeId}-0';
-        final points = _roadPolylineCache[roadKey] ?? fallbackPoints;
-        _requestRoadPolylineIfNeeded(roadKey, fallbackPoints);
-        if (points.length >= 2) {
-          polylines.add(Polyline(
-            points: points,
-            color: color,
-            strokeWidth: 4.0,
-          ));
-        }
-      }
-
-      // Backward direction
-      final bwdStops = route.backwardStopTimes;
-      if (bwdStops.length >= 2) {
-        final fallbackPoints = _stopTimesToPoints(bwdStops);
-        final roadKey = '${route.route.routeId}-1';
-        final points = _roadPolylineCache[roadKey] ?? fallbackPoints;
-        _requestRoadPolylineIfNeeded(roadKey, fallbackPoints);
-        if (points.length >= 2) {
-          polylines.add(Polyline(
-            points: points,
-            color: color.withValues(alpha: 0.5),
-            strokeWidth: 3.0,
-            pattern: const StrokePattern.dotted(),
-          ));
-        }
-      }
-    }
-
-    // Build stop markers (for all routes)
-    final activeStopIds = <String>{};
-    for (final route in allRoutes) {
-      activeStopIds.addAll(route.allStopIds);
-    }
-
-    final stopMarkers = <Marker>[];
-    for (final stopId in activeStopIds) {
-      final stop = widget.stops[stopId];
-      if (stop == null || stop.stopLat == 0 || stop.stopLon == 0) continue;
-      stopMarkers.add(Marker(
-        point: LatLng(stop.stopLat, stop.stopLon),
-        width: 14,
-        height: 14,
-        child: Tooltip(
-          message: stop.stopName,
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.white,
-              shape: BoxShape.circle,
-              border: Border.all(color: const Color(0xFF4299E1), width: 2),
-            ),
-            child: const Center(
-              child: Icon(Icons.circle, size: 5, color: Color(0xFF4299E1)),
-            ),
-          ),
-        ),
-      ));
-    }
-
-    // Build vehicle markers
-    final vehicleMarkers = <Marker>[];
-    for (final v in widget.allVehicles) {
-      if (v.currentStopName == null) continue;
-      final stopMatch = widget.stops.values
-          .where((s) => s.stopName == v.currentStopName)
-          .firstOrNull;
-      if (stopMatch == null || stopMatch.stopLat == 0) continue;
-
-      final isSelected = v.id == widget.vehicle.id;
-      vehicleMarkers.add(Marker(
-        point: LatLng(stopMatch.stopLat, stopMatch.stopLon),
-        width: isSelected ? 60 : 44,
-        height: isSelected ? 36 : 28,
-        child: _VehicleMarkerWidget(
-          vehicleId: v.id,
-          lineNumber: v.currentLineNumber,
-          isSelected: isSelected,
-          isInService: v.status == VehicleStatus.inService,
-          delay: v.delayMinutes,
-        ),
-      ));
-    }
-
-    // Build transfer-node links and markers
-    final nodePolylines = <Polyline>[];
-    final nodeMarkers = <Marker>[];
-    final enabledNodes = widget.transferNodes.where((t) => t.isEnabled).toList();
-
-    for (final node in enabledNodes) {
-      final stop1 = widget.stops[node.stopId1];
-      final stop2 = widget.stops[node.stopId2];
-      if (stop1 == null || stop2 == null) continue;
-      if (stop1.stopLat == 0 || stop1.stopLon == 0 || stop2.stopLat == 0 || stop2.stopLon == 0) {
-        continue;
-      }
-
-      final p1 = LatLng(stop1.stopLat, stop1.stopLon);
-      final p2 = LatLng(stop2.stopLat, stop2.stopLon);
-
-      if (node.stopId1 != node.stopId2) {
-        nodePolylines.add(Polyline(
-          points: [p1, p2],
-          color: const Color(0xFFE67E22),
-          strokeWidth: 2.5,
-          pattern: StrokePattern.dashed(segments: [8, 6]),
-        ));
-      }
-
-      nodeMarkers.add(Marker(
-        point: p1,
-        width: 20,
-        height: 20,
-        child: Tooltip(
-          message:
-              'Uzlový bod: ${node.lineNumber1} ↔ ${node.lineNumber2}\n${node.stopName1}${node.stopId1 != node.stopId2 ? ' / ${node.stopName2}' : ''}',
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.white,
-              shape: BoxShape.circle,
-              border: Border.all(color: const Color(0xFFE67E22), width: 2.5),
-            ),
-            child: const Center(
-              child: Icon(Icons.hub, size: 10, color: Color(0xFFE67E22)),
-            ),
-          ),
-        ),
-      ));
-
-      if (node.stopId1 != node.stopId2) {
-        nodeMarkers.add(Marker(
-          point: p2,
-          width: 16,
-          height: 16,
-          child: Container(
-            decoration: BoxDecoration(
-              color: const Color(0xFFE67E22),
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 1.5),
-            ),
-          ),
-        ));
-      }
-    }
-
-    return Stack(
-      children: [
-        FlutterMap(
-          mapController: _mapController,
-          options: MapOptions(
-            initialCenter: plzenCenter,
-            initialZoom: 13.0,
-            minZoom: 10,
-            maxZoom: 18,
-          ),
-          children: [
-            TileLayer(
-              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              userAgentPackageName: 'cz.blackout.dispatch',
-            ),
-            PolylineLayer(polylines: polylines),
-            PolylineLayer(polylines: nodePolylines),
-            MarkerLayer(markers: stopMarkers),
-            MarkerLayer(markers: nodeMarkers),
-            MarkerLayer(markers: vehicleMarkers),
-          ],
-        ),
-        // Nodes panel (left)
-        Positioned(
-          top: 12,
-          left: 12,
-          child: Container(
-            width: 360,
-            constraints: const BoxConstraints(maxHeight: 260),
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.95),
-              borderRadius: BorderRadius.circular(8),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.12),
-                  blurRadius: 6,
-                ),
-              ],
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Uzly a propojené zastávky (${enabledNodes.length})',
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
-                    color: AppTheme.textPrimary,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Expanded(
-                  child: enabledNodes.isEmpty
-                      ? const Text(
-                          'Žádné uzly k zobrazení.',
-                          style: TextStyle(fontSize: 11, color: AppTheme.textMuted),
-                        )
-                      : ListView.builder(
-                          itemCount: enabledNodes.length,
-                          itemBuilder: (context, index) {
-                            final n = enabledNodes[index];
-                            final label = n.stopId1 == n.stopId2
-                                ? n.stopName1
-                                : '${n.stopName1} → ${n.stopName2}';
-                            return Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 2),
-                              child: Text(
-                                '${n.lineNumber1} ↔ ${n.lineNumber2}: $label',
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  color: AppTheme.textSecondary,
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        // Legend
-        Positioned(
-          bottom: 12,
-          left: 12,
-          child: Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.95),
-              borderRadius: BorderRadius.circular(8),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.15),
-                  blurRadius: 6,
-                ),
-              ],
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text('Legenda',
-                    style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        color: AppTheme.textPrimary)),
-                const SizedBox(height: 4),
-                ...allRoutes.asMap().entries.map((e) => Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 1),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            width: 16,
-                            height: 3,
-                            color: _routeColors[e.key % _routeColors.length],
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            '${e.value.route.routeShortName} – ${e.value.route.routeLongName}',
-                            style: const TextStyle(
-                                fontSize: 10, color: AppTheme.textSecondary),
-                          ),
-                        ],
-                      ),
-                    )),
-                const SizedBox(height: 4),
-                const Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.directions_bus, size: 12, color: Color(0xFF38A169)),
-                    SizedBox(width: 4),
-                    Text('Vozidlo v provozu',
-                        style: TextStyle(fontSize: 10, color: AppTheme.textSecondary)),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ),
-        // Vehicle info card
-        Positioned(
-          top: 12,
-          right: 12,
-          child: Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.95),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: AppTheme.primary.withValues(alpha: 0.3)),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.1),
-                  blurRadius: 6,
-                ),
-              ],
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(widget.vehicle.id,
-                    style: const TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w700,
-                        color: AppTheme.primary)),
-                if (widget.vehicle.currentLineNumber != null)
-                  Text('Linka ${widget.vehicle.currentLineNumber}',
-                      style: const TextStyle(
-                          fontSize: 12, color: AppTheme.textSecondary)),
-                if (widget.vehicle.currentStopName != null)
-                  Text(widget.vehicle.currentStopName!,
-                      style: const TextStyle(
-                          fontSize: 12, color: AppTheme.textSecondary)),
-                if (widget.vehicle.delayMinutes > 0)
-                  Text('Zpoždění: +${widget.vehicle.delayMinutes} min',
-                      style: const TextStyle(
-                          fontSize: 12,
-                          color: AppTheme.danger,
-                          fontWeight: FontWeight.w600)),
-              ],
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  List<LatLng> _stopTimesToPoints(List<GtfsStopTime> stopTimes) {
-    final points = <LatLng>[];
-    for (final st in stopTimes) {
-      final stop = widget.stops[st.stopId];
-      if (stop != null && stop.stopLat != 0 && stop.stopLon != 0) {
-        points.add(LatLng(stop.stopLat, stop.stopLon));
-      }
-    }
-    return points;
-  }
-
-  List<LatLng> _downsample(List<LatLng> points, int maxPoints) {
-    if (points.length <= maxPoints) return points;
-    final result = <LatLng>[];
-    final step = (points.length - 1) / (maxPoints - 1);
-    for (int i = 0; i < maxPoints; i++) {
-      final idx = (i * step).round().clamp(0, points.length - 1);
-      result.add(points[idx]);
-    }
-    return result;
-  }
-
-  void _requestRoadPolylineIfNeeded(String key, List<LatLng> fallbackPoints) {
-    if (_roadPolylineCache.containsKey(key)) return;
-    if (_pendingRoadRequests.contains(key)) return;
-    if (fallbackPoints.length < 2) return;
-
-    _pendingRoadRequests.add(key);
-    _fetchRoadPolyline(fallbackPoints).then((roadPoints) {
-      if (!mounted) return;
-      _pendingRoadRequests.remove(key);
-      if (roadPoints == null || roadPoints.length < 2) return;
-      setState(() {
-        _roadPolylineCache[key] = roadPoints;
-      });
-    });
-  }
-
-  Future<List<LatLng>?> _fetchRoadPolyline(List<LatLng> originalPoints) async {
-    try {
-      final points = _downsample(originalPoints, 90);
-      final coordinates = points
-          .map((p) => '${p.longitude},${p.latitude}')
-          .join(';');
-      final uri = Uri.parse(
-        'https://router.project-osrm.org/match/v1/driving/$coordinates'
-        '?geometries=geojson&overview=full&tidy=true',
-      );
-
-      final response =
-          await http.get(uri).timeout(const Duration(seconds: 10));
-      if (response.statusCode != 200) return null;
-
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final matchings = data['matchings'] as List<dynamic>?;
-      if (matchings == null || matchings.isEmpty) return null;
-
-      final roadPoints = <LatLng>[];
-      for (final match in matchings) {
-        final geometry = (match as Map<String, dynamic>)['geometry']
-            as Map<String, dynamic>?;
-        final coords = geometry?['coordinates'] as List<dynamic>?;
-        if (coords == null) continue;
-        for (final c in coords) {
-          final pair = c as List<dynamic>;
-          if (pair.length < 2) continue;
-          final lon = (pair[0] as num).toDouble();
-          final lat = (pair[1] as num).toDouble();
-          roadPoints.add(LatLng(lat, lon));
-        }
-      }
-
-      return roadPoints;
-    } catch (_) {
-      return null;
-    }
-  }
-}
-
-/// Marker widget for a vehicle on the map
-class _VehicleMarkerWidget extends StatelessWidget {
-  final String vehicleId;
-  final String? lineNumber;
-  final bool isSelected;
-  final bool isInService;
-  final int delay;
-
-  const _VehicleMarkerWidget({
-    required this.vehicleId,
-    this.lineNumber,
-    required this.isSelected,
-    required this.isInService,
-    required this.delay,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final bgColor = isSelected
-        ? AppTheme.primary
-        : isInService
-            ? const Color(0xFF38A169)
-            : const Color(0xFFA0AEC0);
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: bgColor,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: Colors.white,
-          width: isSelected ? 2.5 : 1.5,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: bgColor.withValues(alpha: 0.4),
-            blurRadius: isSelected ? 8 : 4,
-          ),
-        ],
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.directions_bus, size: 12, color: Colors.white),
-          const SizedBox(width: 2),
-          Text(
-            lineNumber ?? vehicleId,
-            style: TextStyle(
-              fontSize: isSelected ? 11 : 10,
-              fontWeight: FontWeight.w700,
-              color: Colors.white,
-            ),
-          ),
-          if (delay > 0) ...[
-            const SizedBox(width: 2),
-            Text(
-              '+$delay',
-              style: const TextStyle(
-                fontSize: 9,
-                fontWeight: FontWeight.w600,
-                color: Color(0xFFFFD700),
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
+    return '${dt.hour.toString().padLeft(2, "0")}:${dt.minute.toString().padLeft(2, "0")}';
   }
 }
 
@@ -1228,13 +1578,7 @@ class _TabButton extends StatelessWidget {
   final IconData icon;
   final bool isSelected;
   final VoidCallback onTap;
-
-  const _TabButton({
-    required this.label,
-    required this.icon,
-    required this.isSelected,
-    required this.onTap,
-  });
+  const _TabButton({required this.label, required this.icon, required this.isSelected, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -1246,27 +1590,14 @@ class _TabButton extends StatelessWidget {
         decoration: BoxDecoration(
           color: isSelected ? AppTheme.primary : AppTheme.surfaceWhite,
           borderRadius: BorderRadius.circular(6),
-          border: Border.all(
-            color: isSelected ? AppTheme.primary : AppTheme.border,
-          ),
+          border: Border.all(color: isSelected ? AppTheme.primary : AppTheme.border),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              icon,
-              size: 16,
-              color: isSelected ? Colors.white : AppTheme.textSecondary,
-            ),
+            Icon(icon, size: 16, color: isSelected ? Colors.white : AppTheme.textSecondary),
             const SizedBox(width: 6),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w500,
-                color: isSelected ? Colors.white : AppTheme.textSecondary,
-              ),
-            ),
+            Text(label, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: isSelected ? Colors.white : AppTheme.textSecondary)),
           ],
         ),
       ),
@@ -1277,7 +1608,6 @@ class _TabButton extends StatelessWidget {
 class _StatusDot extends StatelessWidget {
   final Color color;
   final String label;
-
   const _StatusDot({required this.color, required this.label});
 
   @override
@@ -1285,16 +1615,9 @@ class _StatusDot extends StatelessWidget {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Container(
-          width: 8,
-          height: 8,
-          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-        ),
+        Container(width: 8, height: 8, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
         const SizedBox(width: 4),
-        Text(
-          label,
-          style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
-        ),
+        Text(label, style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary)),
       ],
     );
   }

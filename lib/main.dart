@@ -8,6 +8,7 @@ import 'screens/lines_screen.dart';
 import 'screens/transfers_screen.dart';
 import 'screens/timetable_screen.dart';
 import 'screens/vehicle_map_screen.dart';
+import 'screens/driver_shifts_screen.dart';
 import 'screens/messages_screen.dart';
 import 'screens/distribution_screen.dart';
 
@@ -194,8 +195,10 @@ class _AppShellState extends State<AppShell> {
       case 4:
         return 'Distribuce řidičům';
       case 5:
-        return 'Mapa vozů';
+        return 'Směny řidičů';
       case 6:
+        return 'Mapa vozů';
+      case 7:
         return 'Zprávy';
       default:
         return '';
@@ -215,8 +218,10 @@ class _AppShellState extends State<AppShell> {
       case 4:
         return const DistributionScreen();
       case 5:
-        return const VehicleMapScreen();
+        return const DriverShiftsScreen();
       case 6:
+        return const VehicleMapScreen();
+      case 7:
         return const MessagesScreen();
       default:
         return const DashboardScreen();

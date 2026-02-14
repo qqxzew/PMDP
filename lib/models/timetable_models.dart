@@ -4,12 +4,14 @@ class TimetableJob {
   final String jobId;
   final String lineNumber;
   final String? vehicleId;
+  final String? driverId;
   final List<TimetableStop> stops;
 
   TimetableJob({
     required this.jobId,
     required this.lineNumber,
     this.vehicleId,
+    this.driverId,
     required this.stops,
   });
 
@@ -17,6 +19,7 @@ class TimetableJob {
         'jobId': jobId,
         'lineNumber': lineNumber,
         'vehicleId': vehicleId,
+        'driverId': driverId,
         'stops': stops.map((s) => s.toJson()).toList(),
       };
 
@@ -25,6 +28,7 @@ class TimetableJob {
       jobId: json['jobId'] as String,
       lineNumber: json['lineNumber'] as String,
       vehicleId: json['vehicleId'] as String?,
+      driverId: json['driverId'] as String?,
       stops: (json['stops'] as List)
           .map((s) => TimetableStop.fromJson(s as Map<String, dynamic>))
           .toList(),
@@ -93,6 +97,7 @@ class Transfer {
   final DateTime? waitUntil;
   final bool isGuaranteed;
   final int maxWaitMinutes;
+  final String status;
 
   Transfer({
     required this.jobId,
@@ -101,6 +106,7 @@ class Transfer {
     this.waitUntil,
     required this.isGuaranteed,
     required this.maxWaitMinutes,
+    required this.status,
   });
 
   Map<String, dynamic> toJson() => {
@@ -110,6 +116,7 @@ class Transfer {
         'waitUntil': waitUntil?.toIso8601String(),
         'isGuaranteed': isGuaranteed,
         'maxWaitMinutes': maxWaitMinutes,
+        'status': status,
       };
 
   factory Transfer.fromJson(Map<String, dynamic> json) {
@@ -122,6 +129,7 @@ class Transfer {
           : null,
       isGuaranteed: json['isGuaranteed'] as bool,
       maxWaitMinutes: json['maxWaitMinutes'] as int,
+      status: (json['status'] as String?) ?? 'Sync',
     );
   }
 }

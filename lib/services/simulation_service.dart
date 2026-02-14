@@ -1,12 +1,12 @@
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:latlong2/latlong.dart';
 
 import '../models/timetable_models.dart';
 import '../models/gtfs_models.dart';
-import '../services/osrm_service.dart';
+import 'live_simulation_engine.dart';
+import 'osrm_routing_service.dart';
 
 /// Represents the live position and state of one vehicle on the map.
 class VehiclePosition {
@@ -36,20 +36,30 @@ class VehiclePosition {
 /// Runs a timer that ticks every second, interpolating each vehicle's position
 /// between stops using stop_times and (if available) OSRM road polylines.
 class SimulationService extends ChangeNotifier {
-  SimulationService();
+  final LiveSimulationEngine engine;
+  final OsrmRoutingService? routingService;
+
+  SimulationService(this.engine, {this.routingService});
 
   Timer? _timer;
-  DateTime _simTime = DateTime.now();
+  DateTime _simTime = _getDefaultSimTime();
   double _speedMultiplier = 1.0;
   bool _running = false;
 
   /// Current vehicle positions, keyed by vehicleId.
   final Map<String, VehiclePosition> positions = {};
 
+  // Время по умолчанию: 4:00 утра сегодня
+  static DateTime _getDefaultSimTime() {
+    final now = DateTime.now();
+    return DateTime(now.year, now.month, now.day, 4, 0, 0);
+  }
+
   // Inputs set once from AppState before starting.
-  List<TimetableJob> _jobs = [];
   Map<String, GtfsStop> _stops = {};
   Map<String, List<TimetableJob>> _vehicleJobs = {};
+  final Map<String, List<LatLng>> _segmentPolylines = {};
+  final Set<String> _segmentFetchInFlight = {};
 
   DateTime get simTime => _simTime;
   double get speedMultiplier => _speedMultiplier;
@@ -61,33 +71,11 @@ class SimulationService extends ChangeNotifier {
     required Map<String, GtfsStop> stops,
     required Map<String, List<TimetableJob>> vehicleJobs,
   }) {
-    _jobs = jobs;
     _stops = stops;
     _vehicleJobs = vehicleJobs;
-    _buildStopPolylineKeys();
-  }
-
-  // Pre-request OSRM for every active route segment so polylines are cached
-  // by the time we need them.
-  void _buildStopPolylineKeys() {
-    // group jobs by lineNumber + direction to avoid duplicate requests
-    final seen = <String>{};
-    for (final job in _jobs) {
-      final dirKey = '${job.lineNumber}-${job.direction}';
-      if (seen.contains(dirKey)) continue;
-      seen.add(dirKey);
-
-      final points = <LatLng>[];
-      for (final stop in job.stops) {
-        final s = _stops[stop.stopId];
-        if (s != null && s.stopLat != 0 && s.stopLon != 0) {
-          points.add(LatLng(s.stopLat, s.stopLon));
-        }
-      }
-      if (points.length >= 2) {
-        OsrmService.instance.fetch('sim-$dirKey', points);
-      }
-    }
+    _segmentPolylines.clear();
+    _segmentFetchInFlight.clear();
+    // _buildStopPolylineKeys() removed
   }
 
   void setSpeed(double multiplier) {
@@ -98,7 +86,8 @@ class SimulationService extends ChangeNotifier {
   void start() {
     if (_running) return;
     _running = true;
-    _simTime = DateTime.now();
+    // Если время еще не установлено, используем 4:00 утра
+    _simTime = _getDefaultSimTime();
     _timer = Timer.periodic(const Duration(milliseconds: 200), (_) => _tick());
     notifyListeners();
   }
@@ -255,59 +244,13 @@ class SimulationService extends ChangeNotifier {
     final elapsed = _simTime.difference(segStart).inMilliseconds;
     final t = (elapsed / segDuration).clamp(0.0, 1.0);
 
-    // Try to use road polyline.
-    final dirKey = 'sim-${activeJob.lineNumber}-${activeJob.direction}';
-    final roadPoly = OsrmService.instance.has(dirKey)
-        ? OsrmService.instance.getPolyline(dirKey, [])
-        : null;
+    final pos = _interpolateByOsrmSegment(
+      fromStopId: prevStop.stopId,
+      toStopId: nextStop.stopId,
+      t: t,
+    );
 
-    LatLng pos;
-    double heading = 0;
-
-    if (roadPoly != null && roadPoly.length >= 2) {
-      // Find sub-segment of road polyline between prevStop and nextStop coords.
-      final p1 = _stops[prevStop.stopId];
-      final p2 = _stops[nextStop.stopId];
-      if (p1 != null && p2 != null) {
-        final seg = _extractSubPolyline(
-          roadPoly,
-          LatLng(p1.stopLat, p1.stopLon),
-          LatLng(p2.stopLat, p2.stopLon),
-        );
-        if (seg.length >= 2) {
-          pos = OsrmService.interpolateAlong(seg, t);
-          // Compute heading from nearby point.
-          final t2 = (t + 0.01).clamp(0.0, 1.0);
-          final next = OsrmService.interpolateAlong(seg, t2);
-          heading = _bearing(pos, next);
-        } else {
-          pos = _lerp(
-            LatLng(p1.stopLat, p1.stopLon),
-            LatLng(p2.stopLat, p2.stopLon),
-            t,
-          );
-          heading = _bearing(
-            LatLng(p1.stopLat, p1.stopLon),
-            LatLng(p2.stopLat, p2.stopLon),
-          );
-        }
-      } else {
-        pos = const LatLng(0, 0);
-      }
-    } else {
-      final p1 = _stops[prevStop.stopId];
-      final p2 = _stops[nextStop.stopId];
-      if (p1 == null || p2 == null) return null;
-      pos = _lerp(
-        LatLng(p1.stopLat, p1.stopLon),
-        LatLng(p2.stopLat, p2.stopLon),
-        t,
-      );
-      heading = _bearing(
-        LatLng(p1.stopLat, p1.stopLon),
-        LatLng(p2.stopLat, p2.stopLon),
-      );
-    }
+    if (pos == null) return null;
 
     return VehiclePosition(
       vehicleId: vehicleId,
@@ -316,56 +259,69 @@ class SimulationService extends ChangeNotifier {
       currentStopName: prevStop.name,
       nextStopName: nextStop.name,
       isWaiting: false,
-      heading: heading,
+      heading: 0, // Simplified for now
     );
   }
 
-  /// Extract the sub-section of [poly] closest to [from] → [to].
-  List<LatLng> _extractSubPolyline(
-      List<LatLng> poly, LatLng from, LatLng to) {
-    int nearestFrom = 0;
-    int nearestTo = poly.length - 1;
-    double minD1 = double.infinity, minD2 = double.infinity;
-    const dist = Distance();
-    for (int i = 0; i < poly.length; i++) {
-      final d1 = dist.as(LengthUnit.Meter, poly[i], from);
-      if (d1 < minD1) {
-        minD1 = d1;
-        nearestFrom = i;
-      }
-      final d2 = dist.as(LengthUnit.Meter, poly[i], to);
-      if (d2 < minD2) {
-        minD2 = d2;
-        nearestTo = i;
-      }
-    }
-    if (nearestFrom > nearestTo) {
-      final tmp = nearestFrom;
-      nearestFrom = nearestTo;
-      nearestTo = tmp;
-    }
-    if (nearestTo - nearestFrom < 1) return [from, to];
-    return poly.sublist(nearestFrom, nearestTo + 1);
-  }
+  LatLng? _interpolateByOsrmSegment({
+    required String fromStopId,
+    required String toStopId,
+    required double t,
+  }) {
+    final from = _stops[fromStopId];
+    final to = _stops[toStopId];
+    if (from == null || to == null) return null;
 
-  LatLng _lerp(LatLng a, LatLng b, double t) {
+    final p1 = LatLng(from.stopLat, from.stopLon);
+    final p2 = LatLng(to.stopLat, to.stopLon);
+    final key = '${fromStopId}_$toStopId';
+
+    final cached = _segmentPolylines[key];
+    if (cached != null && cached.length >= 2) {
+      return routingService?.interpolateAlongPolyline(cached, t) ??
+          LatLng(
+            p1.latitude + (p2.latitude - p1.latitude) * t,
+            p1.longitude + (p2.longitude - p1.longitude) * t,
+          );
+    }
+
+    if (routingService != null && !_segmentFetchInFlight.contains(key)) {
+      _segmentFetchInFlight.add(key);
+      unawaited(_fetchSegmentPolyline(
+        key: key,
+        fromStopId: fromStopId,
+        toStopId: toStopId,
+        from: p1,
+        to: p2,
+      ));
+    }
+
     return LatLng(
-      a.latitude + (b.latitude - a.latitude) * t,
-      a.longitude + (b.longitude - a.longitude) * t,
+      p1.latitude + (p2.latitude - p1.latitude) * t,
+      p1.longitude + (p2.longitude - p1.longitude) * t,
     );
   }
 
-  double _bearing(LatLng from, LatLng to) {
-    final dLon = _deg2rad(to.longitude - from.longitude);
-    final y = math.sin(dLon) * math.cos(_deg2rad(to.latitude));
-    final x = math.cos(_deg2rad(from.latitude)) *
-            math.sin(_deg2rad(to.latitude)) -
-        math.sin(_deg2rad(from.latitude)) *
-            math.cos(_deg2rad(to.latitude)) *
-            math.cos(dLon);
-    return (_rad2deg(math.atan2(y, x)) + 360) % 360;
+  Future<void> _fetchSegmentPolyline({
+    required String key,
+    required String fromStopId,
+    required String toStopId,
+    required LatLng from,
+    required LatLng to,
+  }) async {
+    try {
+      final polyline = await routingService!.getSegmentPolyline(
+        fromStopId: fromStopId,
+        from: from,
+        toStopId: toStopId,
+        to: to,
+      );
+      if (polyline.length >= 2) {
+        _segmentPolylines[key] = polyline;
+      }
+    } finally {
+      _segmentFetchInFlight.remove(key);
+    }
   }
-
-  double _deg2rad(double d) => d * math.pi / 180;
-  double _rad2deg(double r) => r * 180 / math.pi;
 }
+
