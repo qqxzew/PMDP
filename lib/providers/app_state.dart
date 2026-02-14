@@ -7,6 +7,7 @@ import '../models/timetable_models.dart';
 import '../models/transfer_node.dart';
 import '../models/vehicle.dart';
 import '../models/driver_models.dart';
+import '../models/driver_shift_models.dart';
 import '../services/gtfs_parser.dart';
 import '../services/live_simulation_engine.dart';
 import '../services/osrm_routing_service.dart';
@@ -16,6 +17,7 @@ import '../services/transfer_manager.dart';
 import '../services/database_service.dart';
 import '../services/timetable_server.dart';
 import '../services/distribution_manager.dart';
+import '../services/shift_splitter_service.dart';
 
 /// Central application state
 class AppState extends ChangeNotifier {
@@ -60,6 +62,10 @@ class AppState extends ChangeNotifier {
 
   // Vehicles
   List<Vehicle> vehicles = [];
+  
+  // Driver shift schedules (split into 8-hour shifts with handovers)
+  List<VehicleShiftSchedule> vehicleShiftSchedules = [];
+  List<DriverWorkload> driverWorkloads = [];
 
   // Messages
   List<DispatchMessage> messages = [];
@@ -95,6 +101,8 @@ class AppState extends ChangeNotifier {
     isTimetableGenerated = false;
     generatedJobs = [];
     vehicles = [];
+    vehicleShiftSchedules = [];
+    driverWorkloads = [];
     generationError = null;
   }
   
@@ -220,107 +228,60 @@ class AppState extends ChangeNotifier {
       return 0;
     }
 
-    // ШАГ 1: Гарантируем минимум 2 автобуса каждой линии (для движения в обе стороны)
-    final minBusesPerRoute = 2;
-    final minRequired = routes.length * minBusesPerRoute;
+    // Розподіл: 50% на лінії 4, 33, 16 і 50% на N4, N5, N6, N7
+    final dayLines = routes.where((r) => ['4', '33', '16'].contains(r.route.routeShortName)).toList();
+    final nightLines = routes.where((r) => ['N4', 'N5', 'N6', 'N7'].contains(r.route.routeShortName)).toList();
     
-    if (totalAvailableBuses < minRequired) {
-      // Недостаточно автобусов даже для минимума - распределяем по 1-2
-      for (int i = 0; i < routes.length; i++) {
-        routes[i].assignedBuses = (i < totalAvailableBuses ~/ 2) ? 2 : ((i < totalAvailableBuses) ? 1 : 0);
+    final halfBuses = totalAvailableBuses ~/ 2;
+    final dayBuses = halfBuses;
+    final nightBuses = totalAvailableBuses - dayBuses;
+    
+    // Мінімум 2 автобуси на лінію
+    final minBusesPerRoute = 2;
+    
+    // Розподіляємо денні лінії
+    if (dayLines.isNotEmpty) {
+      final busesPerDayLine = math.max(minBusesPerRoute, dayBuses ~/ dayLines.length);
+      var remaining = dayBuses;
+      for (int i = 0; i < dayLines.length; i++) {
+        final buses = math.min(busesPerDayLine, remaining);
+        dayLines[i].assignedBuses = buses;
+        remaining -= buses;
       }
-      _invalidateGeneratedTimetable();
-      notifyListeners();
-      return routes.fold(0, (sum, r) => sum + r.assignedBuses);
-    }
-
-    // Выделяем каждой линии по 2 автобуса
-    final assigned = <RouteData, int>{for (final route in routes) route: minBusesPerRoute};
-    var remainingBuses = totalAvailableBuses - minRequired;
-
-    // ШАГ 2: Рассчитываем важность каждой линии
-    // Вес = комбинированный индекс: интенсивность, длительность цикла, дефицит к целевому интервалу
-    final weights = <RouteData, double>{};
-    var totalWeights = 0.0;
-
-    for (final route in routes) {
-      final demandScore = math.max(route.totalTrips.toDouble(), 1.0);
-      final cycleScore = math.max(route.roundTripMinutes.toDouble(), 30.0) / 30.0;
-      final targetNeed = route.requiredBusesForTargetInterval > 0
-        ? math.max(route.requiredBusesForTargetInterval - minBusesPerRoute, 0).toDouble()
-        : 0.0;
-      final coverageScore = math.sqrt(math.max(route.allStopIds.length.toDouble(), 1.0));
-
-      var weight =
-        (demandScore * 0.45) +
-        (cycleScore * 0.25) +
-        (targetNeed * 0.20) +
-        (coverageScore * 0.10);
-
-      if (weight < 1.0) weight = 1.0;
-
-      weights[route] = weight;
-      totalWeights += weight;
-
-      debugPrint('🚌 Linka ${route.route.routeShortName}: '
-        'рейсов=${route.totalTrips}, '
-        'цикл=${route.roundTripMinutes}мин, '
-        'дефицит=${targetNeed.toStringAsFixed(1)}, '
-          'вес=${weight.toStringAsFixed(1)}');
-    }
-
-    if (totalWeights <= 0) {
-      totalWeights = routes.length.toDouble();
-      for (final route in routes) {
-        weights[route] = 1.0;
+      // Розподіляємо залишок
+      if (remaining > 0) {
+        for (final route in dayLines) {
+          if (remaining <= 0) break;
+          route.assignedBuses++;
+          remaining--;
+        }
       }
     }
-
-    // ШАГ 3: Распределяем оставшиеся автобусы пропорционально весам
-    var distributed = 0;
-    final remainders = <RouteData, double>{};
-
-    for (final route in routes) {
-      final weight = weights[route] ?? 1.0;
-      final exactShare = remainingBuses * (weight / totalWeights);
-      final wholeBuses = exactShare.floor();
-
-      assigned[route] = (assigned[route] ?? minBusesPerRoute) + wholeBuses;
-      distributed += wholeBuses;
-      remainders[route] = exactShare - wholeBuses;
-
-      debugPrint('🚌 Linka ${route.route.routeShortName}: '
-          'базовых=$minBusesPerRoute + дополнительных=$wholeBuses = ${assigned[route]} автобусов');
-    }
-
-    // ШАГ 4: Распределяем остаток автобусов по наибольшему дробному остатку
-    var leftover = remainingBuses - distributed;
-
-    final sortedRoutes = routes.toList()
-      ..sort((a, b) {
-        final byRemainder = (remainders[b] ?? 0).compareTo(remainders[a] ?? 0);
-        if (byRemainder != 0) return byRemainder;
-        return (weights[b] ?? 0).compareTo(weights[a] ?? 0);
-      });
-
-    for (final route in sortedRoutes) {
-      if (leftover <= 0) break;
-      assigned[route] = (assigned[route] ?? minBusesPerRoute) + 1;
-      leftover--;
-    }
-
-    // ШАГ 5: Применяем результаты (гарантия минимум 2 на линию уже обеспечена)
-    var totalAssigned = 0;
-    for (final route in routes) {
-      final buses = assigned[route] ?? minBusesPerRoute;
-      route.assignedBuses = buses;
-      totalAssigned += buses;
+    
+    // Розподіляємо нічні лінії
+    if (nightLines.isNotEmpty) {
+      final busesPerNightLine = math.max(minBusesPerRoute, nightBuses ~/ nightLines.length);
+      var remaining = nightBuses;
+      for (int i = 0; i < nightLines.length; i++) {
+        final buses = math.min(busesPerNightLine, remaining);
+        nightLines[i].assignedBuses = buses;
+        remaining -= buses;
+      }
+      // Розподіляємо залишок
+      if (remaining > 0) {
+        for (final route in nightLines) {
+          if (remaining <= 0) break;
+          route.assignedBuses++;
+          remaining--;
+        }
+      }
     }
 
     _invalidateGeneratedTimetable();
     notifyListeners();
     
-    debugPrint('Auto-přiřazení: $totalAssigned autobусов z $totalAvailableBuses (linek: ${routes.length})');
+    final totalAssigned = routes.fold(0, (sum, r) => sum + r.assignedBuses);
+    debugPrint('Auto-přiřazení: $totalAssigned autobusů (Denní: ${dayLines.fold(0, (s, r) => s + r.assignedBuses)}, Noční: ${nightLines.fold(0, (s, r) => s + r.assignedBuses)})');
     return totalAssigned;
   }
 
@@ -329,9 +290,11 @@ class AppState extends ChangeNotifier {
     required String stopId1,
     required String stopName1,
     required String lineNumber1,
+    required String direction1,
     required String stopId2,
     required String stopName2,
     required String lineNumber2,
+    required String direction2,
     int maxWaitMinutes = 5,
     TransferPriority priority = TransferPriority.equal,
   }) {
@@ -339,9 +302,11 @@ class AppState extends ChangeNotifier {
       stopId1: stopId1,
       stopName1: stopName1,
       lineNumber1: lineNumber1,
+      direction1: direction1,
       stopId2: stopId2,
       stopName2: stopName2,
       lineNumber2: lineNumber2,
+      direction2: direction2,
       maxWaitMinutes: maxWaitMinutes,
     );
     
@@ -404,6 +369,11 @@ class AppState extends ChangeNotifier {
 
       isTimetableGenerated = generatedJobs.isNotEmpty;
       _updateVehicles();
+      
+      // Generate driver shift schedules (split into 8-hour shifts)
+      if (isTimetableGenerated) {
+        _generateShiftSchedules();
+      }
 
       // Feed simulation service
       if (isTimetableGenerated) {
@@ -429,9 +399,15 @@ class AppState extends ChangeNotifier {
 
   void _updateVehicles() {
     final vehicleShifts = _generator.getVehicleShifts(generatedJobs);
+    final operationDate = DateTime.now(); // Дата операції для генерації змін
+    
     vehicles = vehicleShifts.entries.map((entry) {
       final firstJob =
           entry.value.isNotEmpty ? entry.value.first : null;
+      
+      // Генеруємо випадкову зміну водія для кожного автобуса
+      final driverShift = DriverShiftInfo.generateRandom(entry.key, operationDate);
+      
       return Vehicle(
         id: entry.key,
         name: 'Vůz ${entry.key}',
@@ -441,6 +417,7 @@ class AppState extends ChangeNotifier {
             firstJob?.stops.firstOrNull?.name,
         status: VehicleStatus.idle,
         assignedJobIds: entry.value.map((j) => j.jobId).toList(),
+        driverShift: driverShift,
       );
     }).toList()
       ..sort((a, b) => a.id.compareTo(b.id));
@@ -450,6 +427,70 @@ class AppState extends ChangeNotifier {
       vehicles[i].status = VehicleStatus.inService;
       vehicles[i].delayMinutes = (i * 3) % 7; // Simulated delays
     }
+  }
+  
+  /// Generate driver shift schedules by splitting 24-hour vehicle jobs into 8-hour shifts
+  void _generateShiftSchedules() {
+    vehicleShiftSchedules = [];
+    
+    final vehicleShifts = _generator.getVehicleShifts(generatedJobs);
+    
+    int globalDriverCounter = 1;
+    
+    for (final entry in vehicleShifts.entries) {
+      final vehicleId = entry.key;
+      final jobs = entry.value;
+      
+      // Split into 8-hour driver shifts with 20-minute handovers
+      final schedule = ShiftSplitterService.splitIntoShifts(
+        vehicleId, 
+        jobs, 
+        startDriverId: globalDriverCounter,
+      );
+      
+      vehicleShiftSchedules.add(schedule);
+      globalDriverCounter += schedule.shifts.length;
+    }
+    
+    // Calculate total workload for each driver
+    driverWorkloads = ShiftSplitterService.calculateDriverWorkloads(vehicleShiftSchedules);
+  }
+  
+  /// Fix overtime shift for a specific vehicle by adjusting job timing
+  Future<void> fixVehicleOvertimeShift(String vehicleId) async {
+    // Get current jobs for this vehicle
+    final vehicleJobs = getVehicleJobs(vehicleId);
+    
+    if (vehicleJobs.isEmpty) {
+      throw Exception('Žádné jízdy pro vozidlo $vehicleId');
+    }
+    
+    // Try to fix overtime by adding delays
+    final fixedJobs = ShiftSplitterService.fixOvertimeShifts(vehicleId, vehicleJobs);
+    
+    if (fixedJobs == null) {
+      throw Exception('Nepodařilo se automaticky opravit směnu. Zkuste přiřadit méně jízd tomuto vozidlu.');
+    }
+    
+    // Replace jobs in generatedJobs
+    generatedJobs.removeWhere((j) => j.vehicleId == vehicleId);
+    generatedJobs.addAll(fixedJobs);
+    
+    // Regenerate shift schedules
+    _generateShiftSchedules();
+    
+    // Update vehicles
+    _updateVehicles();
+    
+    // Update simulation service
+    final vehicleShifts = _generator.getVehicleShifts(generatedJobs);
+    simulationService.load(
+      jobs: generatedJobs,
+      stops: stops,
+      vehicleJobs: vehicleShifts,
+    );
+    
+    notifyListeners();
   }
 
   /// Get jobs for a specific vehicle

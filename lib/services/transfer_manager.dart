@@ -56,9 +56,11 @@ class TransferManager {
             stopId1: stopId,
             stopName1: stop.stopName,
             lineNumber1: route1.route.routeShortName,
+            direction1: '', // Auto-detected, no specific direction
             stopId2: stopId,
             stopName2: stop.stopName,
             lineNumber2: route2.route.routeShortName,
+            direction2: '', // Auto-detected, no specific direction
             isAutomatic: true,
             maxWaitMinutes: 2,
           ));
@@ -85,9 +87,11 @@ class TransferManager {
                 stopId1: nearPair.stopId1,
                 stopName1: nearPair.stopName1,
                 lineNumber1: route1.route.routeShortName,
+                direction1: '', // Auto-detected, no specific direction
                 stopId2: nearPair.stopId2,
                 stopName2: nearPair.stopName2,
                 lineNumber2: route2.route.routeShortName,
+                direction2: '', // Auto-detected, no specific direction
                 isAutomatic: true,
                 maxWaitMinutes: 2,
               ));
@@ -105,9 +109,11 @@ class TransferManager {
     required String stopId1,
     required String stopName1,
     required String lineNumber1,
+    required String direction1,
     required String stopId2,
     required String stopName2,
     required String lineNumber2,
+    required String direction2,
     int maxWaitMinutes = 5,
   }) {
     return TransferNode(
@@ -115,9 +121,11 @@ class TransferManager {
       stopId1: stopId1,
       stopName1: stopName1,
       lineNumber1: lineNumber1,
+      direction1: direction1,
       stopId2: stopId2,
       stopName2: stopName2,
       lineNumber2: lineNumber2,
+      direction2: direction2,
       isAutomatic: false,
       maxWaitMinutes: maxWaitMinutes,
     );

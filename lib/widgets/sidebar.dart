@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import '../theme/app_theme.dart';
+import '../providers/app_state.dart';
 
 /// Navigation sidebar widget
 class AppSidebar extends StatelessWidget {
@@ -119,6 +121,68 @@ class AppSidebar extends StatelessWidget {
             badge: unreadMessages > 0 ? unreadMessages : null,
           ),
           const Spacer(),
+          const Divider(color: Color(0xFF2D3748), height: 1),
+          // Generate Routes Button
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Consumer<AppState>(
+              builder: (context, appState, _) {
+                return SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: appState.isGeneratingTimetable
+                        ? null
+                        : () async {
+                            try {
+                              await appState.generateTimetable();
+                              if (context.mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Trasy byly úspěšně vygenerovány!'),
+                                    backgroundColor: Colors.green,
+                                    duration: Duration(seconds: 2),
+                                  ),
+                                );
+                              }
+                            } catch (e) {
+                              if (context.mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text('Chyba: $e'),
+                                    backgroundColor: Colors.red,
+                                    duration: const Duration(seconds: 3),
+                                  ),
+                                );
+                              }
+                            }
+                          },
+                    icon: appState.isGeneratingTimetable
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                            ),
+                          )
+                        : const Icon(Icons.route, size: 18),
+                    label: Text(
+                      appState.isGeneratingTimetable ? 'Generování...' : 'Generovat trasy',
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF4299E1),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
           const Divider(color: Color(0xFF2D3748), height: 1),
           Padding(
             padding: const EdgeInsets.all(16),

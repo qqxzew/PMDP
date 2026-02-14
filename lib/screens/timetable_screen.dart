@@ -13,13 +13,17 @@ class TimetableScreen extends StatefulWidget {
   State<TimetableScreen> createState() => _TimetableScreenState();
 }
 
-class _TimetableScreenState extends State<TimetableScreen> {
+class _TimetableScreenState extends State<TimetableScreen> with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+  
   String? _selectedLine;
   String? _selectedVehicle;
   String _viewMode = 'line'; // 'line' or 'vehicle'
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // Keep alive
     return Consumer<AppState>(
       builder: (context, state, _) {
         if (!state.isTimetableGenerated) {

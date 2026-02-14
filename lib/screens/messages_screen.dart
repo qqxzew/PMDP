@@ -12,7 +12,10 @@ class MessagesScreen extends StatefulWidget {
   State<MessagesScreen> createState() => _MessagesScreenState();
 }
 
-class _MessagesScreenState extends State<MessagesScreen> {
+class _MessagesScreenState extends State<MessagesScreen> with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+  
   final _replyController = TextEditingController();
   String? _replyToVehicleId;
 
@@ -24,6 +27,7 @@ class _MessagesScreenState extends State<MessagesScreen> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // Keep alive
     return Consumer<AppState>(
       builder: (context, state, _) {
         final messages = List.of(state.messages)
